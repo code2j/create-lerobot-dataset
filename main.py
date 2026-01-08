@@ -15,6 +15,14 @@ import os
 # 허브 접속 차단 (로컬 우선)
 os.environ["HF_HUB_OFFLINE"] = "1"
 
+KINECT_TOPIC        = "/kinect/color/compressed"
+KINECT_DICT         = "kinect_camera"
+
+RIGHT_WRIST_TOPIC   = "/right/camera/cam_wrist/color/image_rect_raw/compressed"
+RIGHT_STATE_TOPIC   = "/right/joint_states"
+RIGHT_WRIST_DICT    = "right_wrist_camera"
+
+
 class GradioLeRobotVideoRecorder(Node):
     def __init__(self):
         super().__init__('gradio_lerobot_video_recorder')
@@ -23,6 +31,7 @@ class GradioLeRobotVideoRecorder(Node):
         self.dataset = None
         self.repo_id = ""
         self.root_path = None
+        self.task_name = "default_task"
 
         self.is_recording = False
         self.is_saving = False
@@ -41,8 +50,8 @@ class GradioLeRobotVideoRecorder(Node):
 
         # 상태 및 액션 (6 joints + 1 gripper = 7)
         self.latest_data = {
-            "image": None,
-            "image_secondary": None,
+            KINECT_DICT: None,
+            RIGHT_WRIST_DICT: None,
             "state": torch.zeros(7),
             "action": torch.zeros(7)
         }
@@ -55,52 +64,127 @@ class GradioLeRobotVideoRecorder(Node):
 
         # 1번 카메라 (Kinect)
         self.subscription = self.create_subscription(
-            CompressedImage, '/kinect/color/compressed', self._kinect_callback, 10)
+            CompressedImage, KINECT_TOPIC, self._kinect_callback, 10)
 
         # 2번 카메라 (Right Wrist)
         self.subscription_secondary = self.create_subscription(
-            CompressedImage, '/right/camera/cam_wrist/color/image_rect_raw/compressed', self._secondary_callback, 10)
+            CompressedImage, RIGHT_WRIST_TOPIC, self._right_wrist_callback, 10)
 
         # 오른쪽 로봇 조인트 상태 (7 joints)
         self.joint_subscription = self.create_subscription(
-            JointState, '/right/joint_states', self._joint_state_callback, 10)
+            JointState, RIGHT_STATE_TOPIC, self._joint_state_callback, 10)
 
         self.create_timer(1.0 / 30.0, self._recording_loop)
 
     def get_ep_count(self):
         return self.dataset.num_episodes if self.dataset is not None else 0
 
-    def init_dataset(self, repo_id, root_dir):
+    def init_dataset(self, repo_id, root_dir, task_name): # task_name 인자 추가
         with self.lock:
             try:
                 self.repo_id = repo_id
                 self.root_path = Path(root_dir).absolute()
+                self.task_name = task_name # 입력받은 테스크 이름 저장
                 dataset_path = self.root_path / self.repo_id
                 info_json = dataset_path / "meta" / "info.json"
+
+                print("root path: ", self.root_path)
+                print("dataset_path: ", dataset_path)
 
                 if info_json.exists():
                     self.dataset = LeRobotDataset(repo_id=self.repo_id, root=dataset_path)
                     self.status_msg = "📂 기존 데이터셋을 로드했습니다."
                 else:
+                    # TODO: Features 설정
                     self.dataset = LeRobotDataset.create(
                         repo_id=self.repo_id,
                         root=dataset_path,
                         fps=30,
+                        robot_type= "omy_f3m",
                         features={
-                            "observation.image": {
-                                "dtype": "video",
-                                "shape": (3, 720, 1280),
-                                "names": ["channels", "height", "width"],
-                                "info": {"fps": 30, "video_backend": "pyav"}
+                            "timestamp": {
+                                "dtype": "float32",
+                                "shape": (1),
+                                "names": None,
+                                "fps": 30
                             },
-                            "observation.image_secondary": {
-                                "dtype": "video",
-                                "shape": (3, 480, 848),
-                                "names": ["channels", "height", "width"],
-                                "info": {"fps": 30, "video_backend": "pyav"}
+                            "frame_index": {
+                                "dtype": "int64",
+                                "shape": (1),
+                                "names": None,
+                                "fps": 30
                             },
-                            "observation.state": {"dtype": "float32", "shape": (7,)},
-                            "action": {"dtype": "float32", "shape": (7,)},
+                            "episode_index": {
+                                "dtype": "int64",
+                                "shape": (1),
+                                "names": None,
+                                "fps": 30
+                            },
+                            "index": {
+                                "dtype": "int64",
+                                "shape": (1),
+                                "names": None,
+                                "fps": 30
+                            },
+                            "task_index": {
+                                "dtype": "int64",
+                                "shape": (1),
+                                "names": None,
+                                "fps": 30
+                            },
+
+                            "observation.images.cam_top": {
+                                "dtype": "video",
+                                "shape": (1280, 720, 3),
+                                "names": ["width", "height", "channels"],
+                                "info": {
+                                    "video.height": 720,
+                                    "video.width": 1280,
+                                    "video.channels": 3,
+                                    "video.codec": "libx264",
+                                    "video.pix_fmt": "yuv420p"
+                                }
+
+                            },
+                            "observation.images.right_cam_wrist": {
+                                "dtype": "video",
+                                "shape": (848, 480, 3),
+                                "names": ["width", "height", "channels"],
+                                "info": {
+                                    "video.height": 480,
+                                    "video.width": 848,
+                                    "video.channels": 3,
+                                    "video.codec": "libx264",
+                                    "video.pix_fmt": "yuv420p"
+                                }
+
+                            },
+                            "observation.state": {
+                                "dtype": "float32",
+                                "shape": (7,),
+                                "names": [
+                                    "right_joint1",
+                                    "right_joint2",
+                                    "right_joint3",
+                                    "right_joint4",
+                                    "right_joint5",
+                                    "right_joint6",
+                                    "right_rh_r1_joint"
+                                ]
+                            },
+                            "action": {
+                                "dtype": "float32",
+                                "shape": (7,),
+                                "names": [
+                                    "right_joint1",
+                                    "right_joint2",
+                                    "right_joint3",
+                                    "right_joint4",
+                                    "right_joint5",
+                                    "right_joint6",
+                                    "right_rh_r1_joint"
+                                ]
+                            },
                         },
                         use_videos=True,
                     )
@@ -108,7 +192,7 @@ class GradioLeRobotVideoRecorder(Node):
                 return self.status_msg, self.get_ep_count()
 
             except Exception as e:
-                self.status_msg = "❌ 기존 데이터셋 경로를 제거하세요"
+                self.status_msg = f"❌ 오류: {str(e)}"
                 return self.status_msg, 0
 
 
@@ -127,7 +211,6 @@ class GradioLeRobotVideoRecorder(Node):
                 self.latest_data["state"] = joint_tensor
                 self.latest_data["action"] = joint_tensor
 
-
     def _kinect_callback(self, msg):
         """키넥트 데이터 수신 콜백"""
         np_arr = np.frombuffer(msg.data, np.uint8)
@@ -136,10 +219,10 @@ class GradioLeRobotVideoRecorder(Node):
             self.res_main = f"{img_raw.shape[1]}x{img_raw.shape[0]}"
             with self.lock:
                 rgb = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
-                self.latest_data["image"] = rgb
+                self.latest_data[KINECT_DICT] = rgb
                 self.current_frame_for_ui = rgb
 
-    def _secondary_callback(self, msg):
+    def _right_wrist_callback(self, msg):
         """오른쪽 손목 카메라 데이터 수신 콜백"""
         np_arr = np.frombuffer(msg.data, np.uint8)
         img_raw = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -147,7 +230,7 @@ class GradioLeRobotVideoRecorder(Node):
             self.res_sub = f"{img_raw.shape[1]}x{img_raw.shape[0]}"
             with self.lock:
                 rgb = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
-                self.latest_data["image_secondary"] = rgb
+                self.latest_data[RIGHT_WRIST_DICT] = rgb
                 self.current_frame_secondary_for_ui = rgb
 
     def _recording_loop(self):
@@ -155,32 +238,31 @@ class GradioLeRobotVideoRecorder(Node):
         if not self.is_recording or self.dataset is None:
             return
         with self.lock:
-            if self.latest_data["image"] is None:
+            if self.latest_data[KINECT_DICT] is None:
                 self.status_msg = "⚠️ 키넥트 데이터 없음"
-                return # 키넥트 데이터 없으면 넘어감
+                return
 
-            if self.latest_data["image_secondary"] is None:
+            if self.latest_data[RIGHT_WRIST_DICT] is None:
                 self.status_msg = "⚠️ 오른쪽 손목 카메라 데이터 없음"
-                return # 오른쪽 손목 카메라 데이터 없으면 넘어감
+                return
 
 
             self.elapsed_time = time.time() - self.start_time
             if self.elapsed_time >= self.max_time:
-                # 에피소드의 최대 녹화 시간을 넘어감
-                self.is_recording = False # 녹화 중지
-                threading.Thread(target=self._save_episode_internal, daemon=True).start() # 에피소드 저장
+                self.is_recording = False
+                threading.Thread(target=self._save_episode_internal, daemon=True).start()
                 return
 
-            img_tensor = torch.from_numpy(self.latest_data["image"]).permute(2, 0, 1)
-            img_secondary_tensor = torch.from_numpy(self.latest_data["image_secondary"]).permute(2, 0, 1)
+            img_tensor = torch.from_numpy(self.latest_data[KINECT_DICT]).permute(1, 0, 2)
+            img_secondary_tensor = torch.from_numpy(self.latest_data[RIGHT_WRIST_DICT]).permute(1, 0, 2)
 
-            # 프레임 추가
+            # TODO: 데이터 추가
             self.dataset.add_frame({
-                "observation.image": img_tensor,
-                "observation.image_secondary": img_secondary_tensor,
+                "observation.images.cam_top": img_tensor,
+                "observation.images.right_cam_wrist": img_secondary_tensor,
                 "observation.state": self.latest_data["state"],
                 "action": self.latest_data["action"],
-                "task": "multi_cam_joint_task_v3"
+                "task": self.task_name
             })
             self.frame_count += 1
 
@@ -207,9 +289,13 @@ class GradioLeRobotVideoRecorder(Node):
                 self.is_saving = False
 
     def start_rec(self):
+        """녹화 시작 버튼"""
         if self.dataset is None:
             self.status_msg = "⚠️ 데이터셋 초기화/불러오기를 먼저 해주세요"
             return self.status_msg, 0, ""
+        if self.is_recording:
+            self.status_msg = "⚠️ 이미 녹화 중입니다"
+            return self.status_msg
         with self.lock:
             self._clear_buffer_internal()
             self.is_recording = True
@@ -220,6 +306,7 @@ class GradioLeRobotVideoRecorder(Node):
         return self.status_msg, self.get_ep_count(), ""
 
     def retry_rec(self):
+        """재시작 버튼"""
         if self.dataset is None: return self.status_msg, 0, ""
         with self.lock:
             self._clear_buffer_internal()
@@ -230,6 +317,7 @@ class GradioLeRobotVideoRecorder(Node):
         return self.status_msg, self.get_ep_count(), ""
 
     def _clear_buffer_internal(self):
+        """녹화중인 데이터 버퍼 초기화"""
         if self.dataset is not None:
             if hasattr(self.dataset, 'clear_episode_buffer'):
                 self.dataset.clear_episode_buffer()
@@ -237,6 +325,7 @@ class GradioLeRobotVideoRecorder(Node):
                 self.dataset._frames = []
 
     def next_episode(self):
+        """에피소드 완료 버튼"""
         if self.dataset is None: return self.status_msg, 0, ""
         if self.is_recording:
             self.is_recording = False
@@ -244,6 +333,7 @@ class GradioLeRobotVideoRecorder(Node):
         return self.status_msg, self.get_ep_count(), ""
 
     def finalize_dataset(self):
+        """데이터셋 수집 종료 버튼"""
         if self.dataset is None: return "⚠️ 미설정", 0, ""
         with self.lock:
             self.dataset.finalize()
@@ -251,6 +341,7 @@ class GradioLeRobotVideoRecorder(Node):
             return self.status_msg, self.get_ep_count(), ""
 
     def update_ui_components(self):
+        """UI 컴포넌트 업데이트"""
         progress_val = 0
         bar_label = f"준비 완료: 최대 {self.max_time:.1f}s"
         if self.is_recording:
@@ -265,13 +356,12 @@ class GradioLeRobotVideoRecorder(Node):
                          f"J4:{joints_deg[3]:>6.1f}° | J5:{joints_deg[4]:>6.1f}° | J6:{joints_deg[5]:>6.1f}°\n"
                          f"Gripper: {joints_deg[6]:.1f}°")
 
-            # --- 라벨 텍스트 생성 ---
-            main_label = f"Main (Kinect) | {self.res_main}"
-            sub_label = f"Secondary Camera | {self.res_sub}"
+            main_label = f"Kinect camera | {self.res_main}"
+            sub_label = f"Right Wrist Camera | {self.res_sub}"
 
         return (
-            gr.update(value=self.current_frame_for_ui, label=main_label), # 라벨 업데이트
-            gr.update(value=self.current_frame_secondary_for_ui, label=sub_label), # 라벨 업데이트
+            gr.update(value=self.current_frame_for_ui, label=main_label),
+            gr.update(value=self.current_frame_secondary_for_ui, label=sub_label),
             gr.update(value=progress_val, label=bar_label),
             self.status_msg,
             self.get_ep_count(),
@@ -284,38 +374,45 @@ def launch_ui(server_name:str, port:int, dt:float):
     recorder = GradioLeRobotVideoRecorder()
     threading.Thread(target=lambda: rclpy.spin(recorder), daemon=True).start()
 
-    with gr.Blocks(title="LeRobot Collector v3.3") as demo:
-        gr.Markdown("# 🤖 LeRobot v3.3 멀티캠 수집기 (Dynamic Label)")
+    with gr.Blocks(title="LeRobot Collector v3.4") as demo:
+        gr.Markdown("# 🤖 LeRobot v3.4 멀티캠 수집기 (Task 설정 추가)")
 
         with gr.Accordion("⚙️ 설정", open=True):
             with gr.Row():
-                repo_id_input = gr.Textbox(label="Repo ID", value="uon/multi-cam-joint-task")
-                root_path_input = gr.Textbox(label="Root Path", value="outputs/dataset")
+                repo_id_input = gr.Textbox(label="Repo ID", value="uon/HERE_DATASET_NAME")
+                root_path_input = gr.Textbox(label="Root Path", value="outputs")
+                task_name_input = gr.Textbox(label="Task Name", value="HERE_TASK_NAME")
+            with gr.Row():
                 max_time_input = gr.Number(label="최대 시간(초)", value=10.0)
             init_btn = gr.Button("🔄 데이터셋 초기화/불러오기")
 
         with gr.Row():
             with gr.Column(scale=2):
                 with gr.Row():
-                    # 초기 라벨 설정
-                    image_output = gr.Image(label="Main Camera")
-                    image_secondary_output = gr.Image(label="Secondary Camera")
+                    image_output = gr.Image(label="Kinect camera")
+                    image_secondary_output = gr.Image(label="Right wrist camera")
                 joint_info_display = gr.Textbox(label="현재 로봇 조인트 각도 (Degree)", lines=3, interactive=False)
                 progress_bar = gr.Slider(label="준비 완료", minimum=0, maximum=100, value=0, interactive=False)
 
             with gr.Column(scale=1):
                 ep_count_display = gr.Label(value="0", label="현재 에피소드 수")
                 status_text = gr.Label(value="대기 중", label="현재 상태")
-                start_btn = gr.Button("🔴 시작", variant="primary")
-                next_btn = gr.Button("💾 완료 및 저장", variant="secondary")
-                finish_btn = gr.Button("🏁 전체 확정", variant="stop")
+                start_btn = gr.Button("🔴 녹화 시작", variant="primary")
+                next_btn = gr.Button("💾 에피소드 완료", variant="secondary")
+                finish_btn = gr.Button("🏁 데이터 수집 종료", variant="stop")
 
         gr.Timer(dt).tick(
             recorder.update_ui_components,
             outputs=[image_output, image_secondary_output, progress_bar, status_text, ep_count_display, joint_info_display]
         )
 
-        init_btn.click(recorder.init_dataset, inputs=[repo_id_input, root_path_input], outputs=[status_text, ep_count_display])
+        # 초기화 버튼 클릭 시 task_name_input도 함께 전달
+        init_btn.click(
+            recorder.init_dataset,
+            inputs=[repo_id_input, root_path_input, task_name_input],
+            outputs=[status_text, ep_count_display]
+        )
+
         start_btn.click(recorder.start_rec, outputs=[status_text, ep_count_display])
         next_btn.click(lambda: (recorder.next_episode()[0], recorder.get_ep_count()), outputs=[status_text, ep_count_display])
         finish_btn.click(recorder.finalize_dataset, outputs=[status_text, ep_count_display])
