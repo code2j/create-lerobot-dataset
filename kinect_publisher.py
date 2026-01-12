@@ -1,16 +1,17 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from cv_bridge import CvBridge
+
 import cv2
 import numpy as np
+
 from pyk4a import PyK4A, Config, ColorResolution, DepthMode, FPS, ImageFormat
 
 class KinectPublisher(Node):
     def __init__(self, topic_name):
         super().__init__('kinect_publisher')
 
-        # 1. 퍼블리셔 설정 (/kinect/color/compressed)
+        # 1. 퍼블리셔 설정
         self.publisher_ = self.create_publisher(
             CompressedImage,
             topic_name,
@@ -19,21 +20,17 @@ class KinectPublisher(Node):
 
         # 2. Azure Kinect 설정
         self.config = Config(
-            color_resolution=ColorResolution.RES_720P,
-            depth_mode=DepthMode.OFF,
-            camera_fps=FPS.FPS_30,
-            color_format=ImageFormat.COLOR_BGRA32,
-            synchronized_images_only=False,
+            color_resolution=ColorResolution.RES_720P,  # 해상도
+            depth_mode=DepthMode.OFF,                   # 뎁스 여부
+            camera_fps=FPS.FPS_30,                      # FPS
+            color_format=ImageFormat.COLOR_BGRA32,      # 포멧
+            synchronized_images_only=False,             # 컬러와 뎁스가 모두 캡쳐된 경우에 반환할지 여부
         )
 
         self.k4a = PyK4A(config=self.config)
         self.k4a.start()
 
-        self.bridge = CvBridge()
-
-        # 타이머 설정 (30 FPS에 맞춰 약 0.033초마다 실행)
-        self.timer = self.create_timer(1.0 / 30.0, self.timer_callback)
-        self.get_logger().info('Kinect Publisher Node has been started.')
+        self.timer = self.create_timer(1.0 / 30.0, self.timer_callback) # 타이머 30Hz
 
     def timer_callback(self):
         try:
@@ -43,7 +40,7 @@ class KinectPublisher(Node):
                 # BGRA -> BGR 변환
                 color_image = capture.color[:, :, :3]
 
-                # OpenCV 이미지를 CompressedImage 메시지로 변환 (jpeg 압축)
+                # CompressedImage 메시지 수동 구성
                 msg = CompressedImage()
                 msg.header.stamp = self.get_clock().now().to_msg()
                 msg.header.frame_id = 'kinect_color_frame'
@@ -54,7 +51,6 @@ class KinectPublisher(Node):
                 if success:
                     msg.data = encoded_image.tobytes()
                     self.publisher_.publish(msg)
-                    # self.get_logger().info('Publishing compressed image')
 
         except Exception as e:
             self.get_logger().error(f'Error in timer_callback: {e}')
