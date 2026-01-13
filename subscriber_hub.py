@@ -30,7 +30,46 @@ class SubscriberHub(Node):
                 # BGR(OpenCV) -> RGB 변환
                 self.current_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         except Exception as e:
-            self.get_logger().error(f"이미지 처리 에러: {e}")
+            print(f"이미지 처리 에러: {e}")
+
+
+
+def run(hub: SubscriberHub):
+    # ROS 2 spin을 별도 스레드에서 실행하여 Gradio와 충돌 방지
+    ros_thread = threading.Thread(target=rclpy.spin, args=(hub,), daemon=True)
+    ros_thread.start()
+
+    # Gradio UI 구성
+    with gr.Blocks() as demo:
+        gr.Markdown("## Kinect")
+        image_view = gr.Image(label="Kinect View")
+
+        # 타이머 설정
+        timer = gr.Timer(value=1/60) # 60 hz
+
+        # hub의 최신 프레임을 반환
+        def get_frame():
+            return hub.current_frame
+
+        # image_view 업데이트
+        timer.tick(fn=get_frame, outputs=image_view)
+
+    try:
+        demo.launch(server_name="0.0.0.0", server_port=7861)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        hub.destroy_node()
+        rclpy.shutdown()
+
+def run_without_visualize(hub: SubscriberHub):
+    try:
+        rclpy.spin(hub)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        hub.destroy_node()
+        rclpy.shutdown()
 
 
 def main():
@@ -45,42 +84,14 @@ def main():
 
     if args.vis:
         print("시각화 모드: ON")
+        run(hub)
 
-        # ROS 2 spin을 별도 스레드에서 실행하여 Gradio와 충돌 방지
-        ros_thread = threading.Thread(target=rclpy.spin, args=(hub,), daemon=True)
-        ros_thread.start()
-
-        # Gradio UI 구성
-        with gr.Blocks() as demo:
-            gr.Markdown("## Kinect")
-            image_view = gr.Image(label="Kinect View")
-
-            # 타이머 설정
-            timer = gr.Timer(value=1/60) # 60 hz
-
-            # hub의 최신 프레임을 반환
-            def get_frame():
-                return hub.current_frame
-
-            # image_view 업데이트
-            timer.tick(fn=get_frame, outputs=image_view)
-
-        try:
-            demo.launch(server_name="0.0.0.0", server_port=7861)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            hub.destroy_node()
-            rclpy.shutdown()
     else:
         print("시각화 모드: OFF")
-        try:
-            rclpy.spin(hub)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            hub.destroy_node()
-            rclpy.shutdown()
+        run_without_visualize(hub)
+
+
+
 
 if __name__ == '__main__':
     main()
