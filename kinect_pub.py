@@ -15,7 +15,7 @@ class KinectPublisher(Node):
     def __init__(self, topic_name):
         super().__init__('kinect_publisher')
 
-        # 1. 퍼블리셔 설정
+        # 퍼블리셔 설정
         self.topic_name = topic_name
         self.publisher_ = self.create_publisher(
             CompressedImage,
@@ -23,7 +23,7 @@ class KinectPublisher(Node):
             10
         )
 
-        # 2. Azure Kinect 설정
+        # Azure Kinect 설정
         self.config = Config(
             color_resolution=ColorResolution.RES_720P,  # 해상도
             depth_mode=DepthMode.OFF,                   # 뎁스 여부
@@ -35,33 +35,44 @@ class KinectPublisher(Node):
         self.k4a = PyK4A(config=self.config)
         self.k4a.start()
 
-        print(f'키넥트 퍼블리셔 시작: {topic_name}')
+        print('=== Azure Kinect Publisher 시작 ===')
+        print(f'토픽 : {topic_name}')
+        print(f'해상도 : {self.config.color_resolution.name}')
+        print(f'FPS : {self.config.camera_fps.name}')
+        print('====================================')
         self.timer = self.create_timer(1.0 / 30.0, self.timer_callback) # 타이머 30Hz
 
     def timer_callback(self):
+        """타이머 콜백 (조기 리턴 방식)"""
         try:
             capture = self.k4a.get_capture()
 
-            if capture.color is not None:
-                # BGRA -> BGR 변환
-                color_image = capture.color[:, :, :3]
+            # 데이터가 없으면 즉시 종료
+            if capture.color is None:
+                return
 
-                # CompressedImage 메시지 구성
-                msg = CompressedImage()
-                msg.header.stamp = self.get_clock().now().to_msg()  # 타임 스템프
-                msg.header.frame_id = 'kinect_color_frame'          # 프레임 아이디
-                msg.format = "jpeg"                                 # 포멧
+            # 이미지 변환 (BGRA -> BGR)
+            color_image = capture.color[:, :, :3]
 
-                # JPEG 압축 수행
-                success, encoded_image = cv2.imencode('.jpg', color_image)
-                if success:
-                    msg.data = encoded_image.tobytes()
-                    self.publisher_.publish(msg)
+            # JPEG 압축 수행
+            success, encoded_image = cv2.imencode('.jpg', color_image)
+            if not success:
+                return
+
+            # 메시지 구성 및 발행
+            msg = CompressedImage()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'kinect_color_frame'
+            msg.format = "jpeg"
+            msg.data = encoded_image.tobytes()
+
+            self.publisher_.publish(msg)
 
         except Exception as e:
-            print(f'타이머 콜백 에러: {e}')
+            self.get_logger().error(f'타이머 콜백 에러: {e}')
 
     def destroy_node(self):
+        """키네틱 퍼블리셔 종료"""
         self.k4a.stop()
         super().destroy_node()
 
