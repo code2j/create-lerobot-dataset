@@ -113,6 +113,7 @@ class InferenceManager:
     def _convert_images2tensors(
             self,
             images: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
+        """ Raw 이미지 데이터를 학습용 텐서로 변환 (numpy -> torch) """
 
         processed_images = {}
         for key, value in images.items():
@@ -128,6 +129,7 @@ class InferenceManager:
     def _convert_np2tensors(
             self,
             data):
+        """ numpy 데이터(센서, State)를 학습용 텐서로 변환 (numpy -> torch) """
         if isinstance(data, list):
             data = np.array(data)
         tensor_data = torch.from_numpy(data)
