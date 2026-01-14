@@ -43,11 +43,11 @@ class KinectPublisher(Node):
         self.timer = self.create_timer(1.0 / 30.0, self.timer_callback) # 타이머 30Hz
 
     def timer_callback(self):
-        """타이머 콜백 (조기 리턴 방식)"""
+        """키넥트 퍼블리셔 타이머 콜백"""
         try:
             capture = self.k4a.get_capture()
 
-            # 데이터가 없으면 즉시 종료
+            # 데이터가 없으면
             if capture.color is None:
                 return
 

@@ -49,6 +49,12 @@ def run(hub: SubscriberHub):
 
         # hub의 최신 프레임을 반환
         def get_frame():
+            if hub.current_frame is not None:
+                pass
+            else:
+                # 초기 프레임이 없을 경우 빈 이미지 반환
+                return np.zeros((480, 640, 3), dtype=np.uint8) # 적절한 크기로 조정
+
             return hub.current_frame
 
         # image_view 업데이트
