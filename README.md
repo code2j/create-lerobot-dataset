@@ -14,3 +14,14 @@ lerobot-train \
     --steps 50000 \
     --policy.push_to_hub false
 ```
+
+```shell
+lerobot-train \
+     --dataset.repo_id test_dataset \
+     --dataset.root /home/jusik/workspace/lerobot-dataset-collector/dataset/test_dataset \
+     --policy.type act \
+     --output_dir dataset/train/act_uon \
+     --batch_size 1 \
+     --steps 50000 \
+     --policy.push_to_hub false
+```

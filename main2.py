@@ -4,452 +4,279 @@ import numpy as np
 from pathlib import Path
 import threading
 import time
-from io import BytesIO
+import queue
+import os
+import shutil
+
+# NumPy 2.x 호환성 경고 방지를 위한 설정
+os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
 
 # ros2
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, JointState
-
 
 # lerobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_FEATURES
 
 from data_converter import decode_image
-
-class SubscriberHub(Node):
-    def __init__(self, node_name='Subscriber_hub'):
-        super().__init__(node_name)
-
-        self.kinect_topic_msg = None
-        self.right_wristCame_topic_msg = None
-        self.right_follower_topic_msg = None
-        self.right_leader_topic_msg = None
-
-
-        self.init_sub()
-        print(f'노드 시작: {node_name}')
-
-    def init_sub(self):
-        # 키넥트
-        self.create_subscription(
-            CompressedImage,
-            '/right/camera/cam_top/color/image_rect_raw/compressed',
-            self.kinect_callback,
-            10
-        )
-
-        # 오른쪽 손목 카메라
-        self.create_subscription(
-            CompressedImage,
-            '/right/camera/cam_wrist/color/image_rect_raw/compressed',
-            self.right_wrisCam_callback,
-            10
-        )
-
-        # 오른쪽 로봇 조인트
-        self.create_subscription(
-            JointState,
-            '/right/joint_states',
-            self.right_flower_callback,
-            10
-        )
-
-        # 오른쪽 리더암 조인트
-        self.create_subscription(
-            JointState,
-            '/right_robot/leader/joint_states',
-            self.right_leader_callback,
-            10
-        )
-
-    def kinect_callback(self, msg: CompressedImage) -> None:
-        """키넥트 카메라 토픽 콜백"""
-        self.kinect_topic_msg = msg
-
-    def right_wrisCam_callback(self, msg: CompressedImage) -> None:
-        """오른쪽 손목 카메라 토픽 콜백"""
-        self.right_wristCame_topic_msg = msg
-
-    def right_flower_callback(self, msg: JointState) -> None:
-        """오른쪽 팔로우 로봇 조인트 토픽 콜백"""
-        self.right_follower_topic_msg = msg
-
-    def right_leader_callback(self, msg:JointState) -> None:
-        """오른쪽 리더 로봇 조인트 토픽 콜백"""
-        self.right_leader_topic_msg = msg
-
-    def get_latest_data(self):
-        """가장 최신의 데이터 리턴"""
-        return (self.kinect_topic_msg,
-                self.right_wristCame_topic_msg,
-                self.right_follower_topic_msg,
-                self.right_leader_topic_msg)
-
-    def clear_latest_data(self):
-        """모든 토픽 데이터 초기화"""
-        self.kinect_topic_msg = None
-        self.right_wristCame_topic_msg = None
-        self.right_follower_topic_msg = None
-        self.right_leader_topic_msg = None
-
-
-
-
+from subscriber_hub import SubscriberHub
 
 class Dataset_manager:
-    def __init__(self):
+    def __init__(self, subscriber_hub: SubscriberHub):
+        self.subscriber_hub = subscriber_hub
         self.dataset = None
-        self.is_recording = False  # 실제 녹화 여부 플래그
-        self.running = True        # 쓰레드 유지 플래그
+        self.is_recording = False
+        self.running = True
+        self.lock = threading.Lock()
 
-        # 녹화용 쓰레드 설정 및 시작
+        # 비동기 처리를 위한 큐 추가
+        self.data_queue = queue.Queue()
+
+        self.max_record_time = 0
+        self.start_time = 0
+        self.fps = 30
+
+        # 1. 생산자 쓰레드: 데이터를 수집하여 큐에 넣음
         self.record_thread = threading.Thread(target=self._recording_loop, daemon=True)
         self.record_thread.start()
-        print("시스템: 녹화 쓰레드가 시작되었습니다.")
 
-    def init_dataset(self, repo_id, root_dir, task_name, fps) -> bool:
+        # 2. 소비자 쓰레드: 큐에서 데이터를 꺼내 디코딩 및 저장
+        self.consumer_thread = threading.Thread(target=self._consumer_loop, daemon=True)
+        self.consumer_thread.start()
+
+        print("[Info ] 녹화 및 소비자 쓰레드가 시작되었습니다.")
+
+    def init_dataset(self, repo_id, root_dir, task_name, fps) -> str:
         """데이터셋 초기화 및 생성"""
-        try:
+        with self.lock:
             self.repo_id = repo_id
             self.root_path = Path(root_dir).absolute()
             self.task_name = task_name
-            dataset_path = self.root_path / self.repo_id
-            info_json = dataset_path / "meta" / "info.json"
+            self.fps = fps
 
-            # TODO: 임시 조인트 이름
+            dataset_path = self.root_path / self.repo_id
+
             joint_names = [
                 'right_joint1', 'right_joint2', 'right_joint3',
                 'right_joint4', 'right_joint5', 'right_joint6',
                 'right_rh_r1_joint'
             ]
 
-            if info_json.exists():
-                # 이미 데이터셋이 존재하는 경우에 기존 데이터셋을 가져옴
-                self.dataset = LeRobotDataset(repo_id=self.repo_id, root=dataset_path)
-            else:
-                features = DEFAULT_FEATURES.copy()
-                features[f'observation.images.cam_top'] = {
-                    'dtype': 'video',
-                    'names': ['height', 'width', 'channels'],
-                    'shape': (720, 1280, 3)
-                }
-                features[f'observation.images.cam_wrist'] = {
-                    'dtype': 'video',
-                    'names': ['height', 'width', 'channels'],
-                    'shape': (480, 848, 3)
-                }
-                features[f'observation.state'] = {
-                    'dtype': 'float32',
-                    'names': joint_names,
-                    'shape': (7,)
-                }
-                features[f'action'] = {
-                    'dtype': 'float32',
-                    'names': joint_names,
-                    'shape': (7,)
-                }
+            features = DEFAULT_FEATURES.copy()
+            features[f'observation.images.cam_top'] = {
+                'dtype': 'video',
+                'names': ['height', 'width', 'channels'],
+                'shape': (720, 1280, 3)
+            }
+            features[f'observation.images.cam_wrist'] = {
+                'dtype': 'video',
+                'names': ['height', 'width', 'channels'],
+                'shape': (480, 848, 3)
+            }
+            features[f'observation.state'] = {
+                'dtype': 'float32',
+                'names': joint_names,
+                'shape': (7,)
+            }
+            features[f'action'] = {
+                'dtype': 'float32',
+                'names': joint_names,
+                'shape': (7,)
+            }
 
+            self.dataset = LeRobotDataset.create(
+                repo_id=self.repo_id,
+                root=dataset_path,
+                features=features,
+                use_videos=True,
+                fps=fps,
+                robot_type="omy_f3m",
+                image_writer_processes=2,
+                image_writer_threads=4,
+            )
 
-                # 새로운 데이터셋을 생성
-                self.dataset = LeRobotDataset.create(
-                    repo_id=self.repo_id,
-                    root=dataset_path,
-                    fps=fps,
-                    robot_type= "omy_f3m",
-                    features={
-                        "timestamp": {"dtype": "float32", "shape": (1,), "names": None, "fps": fps},
-                        "frame_index": {"dtype": "int64", "shape": (1,), "names": None, "fps": fps},
-                        "episode_index": {"dtype": "int64", "shape": (1,), "names": None, "fps": fps},
-                        "index": {"dtype": "int64", "shape": (1,), "names": None, "fps": fps},
-                        "task_index": {"dtype": "int64", "shape": (1,), "names": None, "fps": fps},
-                        # 키넥트 카메라
-                        "observation.images.cam_top": {
-                            "dtype": "video",
-                            "shape": (3, 720, 1280),
-                            "names": ["channels", "height", "width"],
-                            "info": {
-                                "video.height": 720,
-                                "video.width": 1280,
-                                "video.channels": 3,
-                                "video.codec": "libx264",
-                                "video.pix_fmt": "yuv420p"
-                            }
-                        },
-                        # 오른쪽 손목 카메라
-                        "observation.images.right_cam_wrist": {
-                            "dtype": "video",
-                            "shape": (3, 480, 848),
-                            "names": ["channels", "height", "width"],
-                            "info": {
-                                "video.height": 480,
-                                "video.width": 848,
-                                "video.channels": 3,
-                                "video.codec": "libx264",
-                                "video.pix_fmt": "yuv420p"
-                            }
-                        },
-                        # 로봇의 현재 상태
-                        "observation.state": {
-                            "dtype": "float32",
-                            "shape": (7,),
-                            "names": joint_names
-                        },
-                        # 액션
-                        "action": {
-                            "dtype": "float32",
-                            "shape": (7,),
-                            "names": joint_names
-                        },
-                    },
-                    use_videos=True,
-                )
-            return True # 데이터셋 생성 성공
-        except Exception as e:
-            print(f"데이터셋 초기화 오류: {e}")
-            return False # 데이터셋 생성 실패
-
+            print(f"[Info ] 데이터셋이 성공적으로 초기화되었습니다.")
+            return "데이터셋 초기화 성공"
 
     def _recording_loop(self):
-        """별도 쓰레드에서 무한히 돌아가는 루프"""
+        """생산자: 정밀한 타이밍에 맞춰 데이터만 수집하여 큐에 삽입"""
+        next_time = time.time()
+
         while self.running:
             if self.is_recording and self.dataset is not None:
-                # 여기에 실제 데이터 수집 및 저장 로직이 들어갑니다.
-                self.record()
+                frame_interval = 1.0 / self.fps
 
-                # FPS에 맞게 대기 (예: 30fps라면 약 0.033초)
-                time.sleep(1.0 / self.fps if hasattr(self, 'fps') else 0.1)
+                if self.max_record_time > 0:
+                    if time.time() - self.start_time >= self.max_record_time:
+                        self.stop_recording()
+                        continue
+
+                # 1. 데이터 수집
+                raw_data = self.subscriber_hub.get_latest_data()
+
+                # 2. 큐에 삽입 (에피소드 구분을 위해 현재 에피소드 인덱스 포함 가능)
+                self.data_queue.put(raw_data)
+
+                # 3. 정밀 타이밍 제어
+                next_time += frame_interval
+                sleep_time = next_time - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_time = time.time()
             else:
-                # 녹화 중이 아닐 때는 CPU 점유율을 낮추기 위해 짧게 대기
                 time.sleep(0.1)
+                next_time = time.time()
 
-    def record(self):
-        """실제 프레임을 캡처하고 데이터셋에 추가하는 로직"""
-        # 이 부분에 카메라 프레임 읽기, 로봇 상태 읽기, self.dataset.add_frame() 등의 로직을 구현합니다.
-        # 예: frame = camera.read(), state = robot.get_state()
-        # self.dataset.add_frame({"observation.image": frame, "action": state, ...})
-        print(f"[{time.time():.2f}] 데이터를 기록 중...")
+    def _consumer_loop(self):
+        """소비자: 큐에서 데이터를 꺼내 무거운 작업 수행"""
+        while self.running:
+            try:
+                raw_data = self.data_queue.get(timeout=0.1)
 
-    def start_recording(self):
+                if self.dataset is not None:
+                    kinect_msg, wrist_msg, follow_msg, leader_msg = raw_data
+                    kinect_img = decode_image(kinect_msg)
+                    wrist_img = decode_image(wrist_msg)
+                    follower_joint_data = np.array(follow_msg.position, dtype=np.float32)
+                    leader_joint_data = np.array(leader_msg.position, dtype=np.float32)
+
+                    if kinect_img is not None and wrist_img is not None:
+                        with self.lock:
+                            if self.dataset is not None:
+                                self.dataset.add_frame({
+                                    f'observation.images.cam_top': kinect_img,
+                                    f'observation.images.cam_wrist': wrist_img,
+                                    f'observation.state': follower_joint_data,
+                                    f'action': leader_joint_data,
+                                    f'task': self.task_name
+                                })
+
+                self.data_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[Error] 소비자 루프 오류: {e}")
+
+    def start_recording(self, max_time=0):
         if self.dataset is None:
-            print("오류: 데이터셋이 초기화되지 않았습니다. init_dataset을 먼저 호출하세요.")
-            return
+            return "오류: 데이터셋이 초기화되지 않았습니다."
+
+        # 즉시 다음 녹화가 가능하도록 큐를 비우지 않고 상태만 변경
+        # (이전 녹화 데이터는 소비자 쓰레드가 백그라운드에서 계속 처리 중)
+        self.max_record_time = max_time
+        self.start_time = time.time()
         self.is_recording = True
-        print("시스템: 녹화를 시작합니다.")
+
+        msg = "시스템: 녹화를 시작합니다."
+        print(msg)
+        return msg
 
     def stop_recording(self):
+        if not self.is_recording:
+            return "시스템: 현재 녹화 중이 아닙니다."
+
         self.is_recording = False
-        print("시스템: 녹화를 중단합니다.")
+
+        # 즉시 저장을 호출하는 대신, 별도 쓰레드에서 큐가 비워지면 저장하도록 함
+        threading.Thread(target=self._wait_and_save, daemon=True).start()
+
+        print("시스템: 녹화가 중단되었습니다. 백그라운드에서 저장을 진행합니다.")
+        return "시스템: 녹화 중단 (백그라운드 저장 중)"
+
+    def _wait_and_save(self):
+        """백그라운드에서 큐가 비워질 때까지 기다린 후 저장"""
+        # 현재 시점의 큐 작업이 끝날 때까지 대기
+        self.data_queue.join()
+
+        with self.lock:
+            if self.dataset is not None:
+                self.dataset.save_episode()
+                self.dataset.finalize()
+                print("시스템: 에피소드 저장 완료")
 
     def close(self):
-        """프로그램 종료 시 쓰레드를 안전하게 종료"""
         self.running = False
         self.record_thread.join()
-        print("시스템: 녹화 쓰레드가 종료되었습니다.")
-
-
-
+        self.consumer_thread.join()
+        print("시스템: 모든 쓰레드가 종료되었습니다.")
 
 class GradioVisualizer:
     def __init__(self, subscriber_hub: SubscriberHub):
         self.subscriber_hub = subscriber_hub
-        self.update_interval = 1/30  # 30hz
-
-        # 데이터셋 매니저
-        self.dataset_manager = Dataset_manager()
-
-    def get_latest_data(self):
-        """가장 최신의 데이터 리턴"""
-        # 가장 최신 데이터 가져오기
-        (kinect_compressed_img,
-         right_wrist_compressed_img,
-         right_follower_joint,
-         right_leader_joint) = subscriber_hub.get_latest_data()
-
-        # 이미지 디코딩
-        kinect_img = decode_image(kinect_compressed_img)
-        right_wrist_img = decode_image(right_wrist_compressed_img)
-
-        return kinect_img, right_wrist_img, right_follower_joint, right_leader_joint
+        self.update_interval = 1/30
+        self.dataset_manager = Dataset_manager(self.subscriber_hub)
 
     def ui_timer_callback(self):
-        """UI 업데이트 콜백"""
-        kinect_img, right_wrist_img, follower_joint, _ = self.get_latest_data()
+        (k_msg, w_msg, f_joint, l_joint) = self.subscriber_hub.get_latest_data()
+        k_img = decode_image(k_msg)
+        w_img = decode_image(w_msg)
 
-        # Joint 데이터 추출
-        follower_joint_text = "N/A"
-        if follower_joint is not None:
-            joint_positions = follower_joint.position
-            joint_names = follower_joint.name
+        desired_names = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6', 'right_rh_r1_joint']
 
-            # 원하는 조인트 이름 순서
-            desired_joint_names = [
-                'right_joint1', 'right_joint2', 'right_joint3',
-                'right_joint4', 'right_joint5', 'right_joint6',
-                'right_rh_r1_joint'
-            ]
+        follower_text = "N/A"
+        if f_joint is not None:
+            f_vals = [np.rad2deg(f_joint.position[f_joint.name.index(n)]) if n in f_joint.name else np.nan for n in desired_names]
+            follower_text = f"J1: {f_vals[0]:.1f} J2: {f_vals[1]:.1f} J3: {f_vals[2]:.1f} J4: {f_vals[3]:.1f} J5: {f_vals[4]:.1f} J6: {f_vals[5]:.1f} G: {f_vals[6]:.1f}"
 
-            # 원하는 순서대로 조인트 값 가져오기
-            ordered_joint_values = []
-            for name in desired_joint_names:
-                try:
-                    idx = joint_names.index(name)
-                    ordered_joint_values.append(np.rad2deg(joint_positions[idx]))
-                except ValueError:
-                    ordered_joint_values.append(np.nan) # 해당 조인트가 없으면 NaN
+        leader_text = "N/A"
+        if l_joint is not None:
+            l_vals = [np.rad2deg(l_joint.position[l_joint.name.index(n)]) if n in l_joint.name else np.nan for n in desired_names]
+            leader_text = f"J1: {l_vals[0]:.1f} J2: {l_vals[1]:.1f} J3: {l_vals[2]:.1f} J4: {l_vals[3]:.1f} J5: {l_vals[4]:.1f} J6: {l_vals[5]:.1f} G: {l_vals[6]:.1f}"
 
-            follower_joint_text = (
-                f"J1: {ordered_joint_values[0]:.2f}°  J2: {ordered_joint_values[1]:.2f}°  J3: {ordered_joint_values[2]:.2f}° "
-                f"J4: {ordered_joint_values[3]:.2f}°  J5: {ordered_joint_values[4]:.2f}°  J6: {ordered_joint_values[5]:.2f}°  "
-                f"Gripper: {ordered_joint_values[6]:.2f}°"
-            )
+        # 상태 및 프로세스 표시
+        q_size = self.dataset_manager.data_queue.qsize()
+        if self.dataset_manager.is_recording:
+            elapsed = time.time() - self.dataset_manager.start_time
+            status = f"🔴 녹화 중... {elapsed:.1f}s | 대기 큐: {q_size}"
+        else:
+            if q_size > 0:
+                status = f"⏳ 백그라운드 저장 중... (남은 작업: {q_size})"
+            else:
+                status = "✅ 대기 중 (모든 작업 완료)"
 
-        # Leader joint text
-        leader_joint_text = "N/A"
-        if self.subscriber_hub.right_leader_topic_msg is not None:
-            leader_joint_positions = self.subscriber_hub.right_leader_topic_msg.position
-            leader_joint_names = self.subscriber_hub.right_leader_topic_msg.name
-
-            ordered_leader_values = []
-            for name in desired_joint_names:
-                try:
-                    idx = leader_joint_names.index(name)
-                    ordered_leader_values.append(np.rad2deg(leader_joint_positions[idx]))
-                except ValueError:
-                    ordered_leader_values.append(np.nan)
-
-            leader_joint_text = (
-                f"J1: {ordered_leader_values[0]:.2f}°  J2: {ordered_leader_values[1]:.2f}°  J3: {ordered_leader_values[2]:.2f}° "
-                f"J4: {ordered_leader_values[3]:.2f}°  J5: {ordered_leader_values[4]:.2f}°  J6: {ordered_leader_values[5]:.2f}°  "
-                f"Gripper: {ordered_leader_values[6]:.2f}°"
-            )
-        return kinect_img, right_wrist_img, follower_joint_text, leader_joint_text
+        return k_img, w_img, follower_text, leader_text, status
 
     def create_interface(self):
-        """Gradio 인터페이스 생성"""
-        with gr.Blocks(title="Test ") as demo:
+        default_root_dir = os.path.join(os.getcwd(), "dataset")
+        with gr.Blocks(title="Robot Data Collector") as demo:
+            with gr.Row():
+                kinect_image = gr.Image(label="Kinect", type="numpy")
+                wrist_image = gr.Image(label="Wrist", type="numpy")
 
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### 키넥트 카메라")
-                    kinect_image = gr.Image(
-                        label="Kinect Camera",
-                        type="numpy",
-                        interactive=False
-                    )
-
-                with gr.Column():
-                    gr.Markdown("### 오른쪽 손목 카메라")
-                    wrist_image = gr.Image(
-                        label="Right Wrist Camera",
-                        type="numpy",
-                        interactive=False
-                    )
+                follower_joint_output = gr.Textbox(label="Follower Arm Joints")
+                leader_joint_output = gr.Textbox(label="Leader Arm Joints")
 
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### 로봇 조인트 상태 (Degrees)")
-                    follower_joint_output
-                    leader_joint_output
+                repo_id_input = gr.Textbox(label="Repo ID", value="test_dataset")
+                root_dir_input = gr.Textbox(label="Root Path", value=default_root_dir)
+                task_name_input = gr.Textbox(label="Task", value="test_task")
+                fps_input = gr.Number(label="FPS", value=30)
+                max_time_input = gr.Number(label="Max Time", value=0)
 
-
-        return kinect_img, right_wrist_img, follower_joint_text, leader_joint_output
-
-    def create_interface(self):
-        """Gradio 인터페이스 생성"""
-        with gr.Blocks(title="Test ") as demo:
+            init_btn = gr.Button("Initialize")
+            status_output = gr.Textbox(label="Status")
 
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### 키넥트 카메라")
-                    kinect_image = gr.Image(
-                        label="Kinect Camera",
-                        type="numpy",
-                        interactive=False
-                    )
+                record_btn = gr.Button("Record", variant="primary")
+                stop_btn = gr.Button("Stop", variant="stop")
 
-                with gr.Column():
-                    gr.Markdown("### 오른쪽 손목 카메라")
-                    wrist_image = gr.Image(
-                        label="Right Wrist Camera",
-                        type="numpy",
-                        interactive=False
-                    )
+            init_btn.click(self.dataset_manager.init_dataset, [repo_id_input, root_dir_input, task_name_input, fps_input], status_output)
+            record_btn.click(self.dataset_manager.start_recording, [max_time_input], status_output)
+            stop_btn.click(self.dataset_manager.stop_recording, outputs=status_output)
 
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### 로봇 조인트 상태 (Degrees)")
-                    follower_joint_output = gr.Textbox(label="Follower Arm Joints", interactive=False)
-                    leader_joint_output = gr.Textbox(label="Leader Arm Joints", interactive=False)
-
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### ⚙️ 데이터셋 설정")
-                    repo_id_input = gr.Textbox(label="Repo ID", value="uon/test_dataset")
-                    root_dir_input = gr.Textbox(label="Root Directory", value="./dataset")
-                    task_name_input = gr.Textbox(label="Task Name", value="test_task_name")
-                    # FPS 설정 추가
-                    fps_input = gr.Number(label="데이터셋 FPS", value=30, precision=0)
-
-                    init_btn = gr.Button("데이터셋 초기화 (Initialize)", variant="primary")
-                    status_output = gr.Textbox(label="시스템 상태", interactive=False)
-
-            with gr.Row():
-                record_btn = gr.Button("데이터셋 녹화 (Record)", variant="primary")
-
-
-            # 데이터 초기화 버튼 이벤트
-            init_btn.click(
-                fn=self.dataset_manager.init_dataset,
-                inputs=[repo_id_input, root_dir_input, task_name_input, fps_input],
-                outputs=status_output
-            )
-
-            # 녹화 시작 버튼
-            record_btn.click(
-                fn=self.dataset_manager.start_recording,
-                inputs=[],
-                outputs=[]
-            )
-
-            # 100 ms 업데이트
             timer = gr.Timer(value=self.update_interval)
-            timer.tick(
-                self.ui_timer_callback,
-                outputs=[kinect_image, wrist_image, follower_joint_output, leader_joint_output]
-            )
-
+            timer.tick(self.ui_timer_callback, outputs=[kinect_image, wrist_image, follower_joint_output, leader_joint_output, status_output])
         return demo
 
-    def launch(self, share=False, server_name="0.0.0.0", server_port=7860):
-        """Gradio 앱 실행"""
-        demo = self.create_interface()
-        demo.launch(
-            share=share,
-            server_name=server_name,
-            server_port=server_port,
-            show_error=True
-        )
+    def launch(self):
+        self.create_interface().launch(server_name="0.0.0.0", server_port=7860)
 
-
-# 사용 예시
 if __name__ == "__main__":
     import rclpy
-
     rclpy.init()
-
-    # SubscriberHub 노드 생성
-    subscriber_hub = SubscriberHub()
-
-    # Gradio 시각화기 생성
-    visualizer = GradioVisualizer(subscriber_hub)
-
-    # 스핀 스레드 시작 (ROS 2 메시지 수신을 위해)
-    def spin_node():
-        rclpy.spin(subscriber_hub)
-
-    spin_thread = threading.Thread(target=spin_node, daemon=True)
-    spin_thread.start()
-
-    # Gradio 앱 실행
-    visualizer.launch(share=False, server_port=7860)
+    hub = SubscriberHub()
+    threading.Thread(target=lambda: rclpy.spin(hub), daemon=True).start()
+    GradioVisualizer(hub).launch()
