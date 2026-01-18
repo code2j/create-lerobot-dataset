@@ -193,14 +193,22 @@ class Dataset_manager:
 
     def _wait_and_save(self):
         """백그라운드에서 큐가 비워질 때까지 기다린 후 저장"""
-        # 현재 시점의 큐 작업이 끝날 때까지 대기
-        self.data_queue.join()
+        print("시스템: 남은 데이터를 처리 중입니다...")
+        self.data_queue.join() # 소비자가 모든 데이터를 처리할 때까지 대기
 
         with self.lock:
             if self.dataset is not None:
-                self.dataset.save_episode()
-                # self.dataset.finalize() # stop_recording에서는 에피소드만 저장하고 finalize는 별도 버튼으로 분리
-                print("시스템: 에피소드 저장 완료")
+                # 현재 에피소드 버퍼에 프레임이 있는지 확인 (LeRobot 버전에 따른 체크)
+                # 보통 self.dataset._episode_buffer를 확인하거나 try-except 사용
+                try:
+                    # 에피소드 저장 시도
+                    self.dataset.save_episode()
+                    print("시스템: 에피소드 저장 완료")
+                except ValueError as e:
+                    # 데이터가 없는 경우 LeRobot이 던지는 ValueError 처리
+                    print(f"시스템: 저장할 프레임이 없어 에피소드를 생성하지 않았습니다. (사유: {e})")
+                except Exception as e:
+                    print(f"시스템: 에피소드 저장 중 예상치 못한 오류: {e}")
 
     def finalize_dataset(self):
         """데이터 수집 완료 및 데이터셋 최종화"""
