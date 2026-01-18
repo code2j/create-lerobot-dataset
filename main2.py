@@ -7,6 +7,8 @@ import time
 import queue
 import os
 import shutil
+import subprocess
+import signal
 
 # NumPy 2.x 호환성 경고 방지를 위한 설정
 os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
@@ -36,6 +38,10 @@ class Dataset_manager:
         self.max_record_time = 0
         self.start_time = 0
         self.fps = 30
+
+        # 학습 프로세스 관리
+        self.train_process = None
+        self.train_log = ""
 
         # 1. 생산자 쓰레드: 데이터를 수집하여 큐에 넣음
         self.record_thread = threading.Thread(target=self._recording_loop, daemon=True)
@@ -193,13 +199,106 @@ class Dataset_manager:
         with self.lock:
             if self.dataset is not None:
                 self.dataset.save_episode()
-                self.dataset.finalize()
+                # self.dataset.finalize() # stop_recording에서는 에피소드만 저장하고 finalize는 별도 버튼으로 분리
                 print("시스템: 에피소드 저장 완료")
+
+    def finalize_dataset(self):
+        """데이터 수집 완료 및 데이터셋 최종화"""
+        if self.dataset is None:
+            return "오류: 데이터셋이 초기화되지 않았습니다."
+
+        if self.is_recording:
+            return "오류: 녹화 중에는 데이터셋을 완료할 수 없습니다."
+
+        # 큐에 남은 작업이 있는지 확인
+        if not self.data_queue.empty():
+            return "시스템: 아직 처리 중인 데이터가 있습니다. 잠시 후 다시 시도해주세요."
+
+        with self.lock:
+            try:
+                self.dataset.finalize()
+                msg = "시스템: 데이터 수집 완료 및 데이터셋 최종화 성공"
+                print(msg)
+                return msg
+            except Exception as e:
+                msg = f"시스템: 데이터셋 최종화 중 오류 발생: {e}"
+                print(msg)
+                return msg
+
+    def start_training(self, repo_id, root_dir, policy_type, output_dir, batch_size, steps, push_to_hub):
+        """학습 프로세스 시작"""
+        if self.train_process is not None and self.train_process.poll() is None:
+            return "오류: 이미 학습이 진행 중입니다."
+
+        # 명령어 구성
+        cmd = [
+            "lerobot-train",
+            "--dataset.repo_id", str(repo_id),
+            "--dataset.root", str(root_dir),
+            "--policy.type", str(policy_type),
+            "--output_dir", str(output_dir),
+            "--batch_size", str(int(batch_size)),
+            "--steps", str(int(steps)),
+            "--policy.push_to_hub", str(push_to_hub).lower()
+        ]
+
+        self.train_log = f"명령어 실행: {' '.join(cmd)}\n\n"
+
+        try:
+            # 비동기적으로 프로세스 실행
+            self.train_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                preexec_fn=os.setsid # 프로세스 그룹으로 묶어서 종료 가능하게 함
+            )
+
+            # 로그 읽기 쓰레드 시작
+            threading.Thread(target=self._read_train_logs, daemon=True).start()
+
+            return "시스템: 학습을 시작합니다."
+        except Exception as e:
+            return f"오류: 학습 시작 실패: {e}"
+
+    def _read_train_logs(self):
+        """학습 로그를 실시간으로 읽어 저장"""
+        for line in iter(self.train_process.stdout.readline, ''):
+            self.train_log += line
+        self.train_process.stdout.close()
+        self.train_process.wait()
+        self.train_log += "\n[시스템] 학습 프로세스가 종료되었습니다."
+
+    def stop_training(self):
+        """학습 프로세스 중단"""
+        if self.train_process is None or self.train_process.poll() is not None:
+            return "시스템: 현재 진행 중인 학습이 없습니다."
+
+        try:
+            # 프로세스 그룹 전체 종료
+            os.killpg(os.getpgid(self.train_process.pid), signal.SIGTERM)
+            return "시스템: 학습 중단 명령을 보냈습니다."
+        except Exception as e:
+            return f"오류: 학습 중단 실패: {e}"
+
+    def get_train_status(self):
+        """학습 상태 및 로그 반환"""
+        if self.train_process is None:
+            status = "대기 중"
+        elif self.train_process.poll() is None:
+            status = "학습 진행 중..."
+        else:
+            status = f"종료됨 (코드: {self.train_process.returncode})"
+
+        return status, self.train_log
 
     def close(self):
         self.running = False
         self.record_thread.join()
         self.consumer_thread.join()
+        if self.train_process and self.train_process.poll() is None:
+            os.killpg(os.getpgid(self.train_process.pid), signal.SIGTERM)
         print("시스템: 모든 쓰레드가 종료되었습니다.")
 
 class GradioVisualizer:
@@ -236,39 +335,86 @@ class GradioVisualizer:
             else:
                 status = "✅ 대기 중 (모든 작업 완료)"
 
-        return k_img, w_img, follower_text, leader_text, status
+        # 학습 상태 업데이트
+        train_status, train_log = self.dataset_manager.get_train_status()
+
+        return k_img, w_img, follower_text, leader_text, status, train_status, train_log
 
     def create_interface(self):
         default_root_dir = os.path.join(os.getcwd(), "dataset")
-        with gr.Blocks(title="Robot Data Collector") as demo:
-            with gr.Row():
-                kinect_image = gr.Image(label="Kinect", type="numpy")
-                wrist_image = gr.Image(label="Wrist", type="numpy")
 
-            with gr.Row():
-                follower_joint_output = gr.Textbox(label="Follower Arm Joints")
-                leader_joint_output = gr.Textbox(label="Leader Arm Joints")
+        with gr.Blocks(title="Robot Data Collector & Trainer") as demo:
+            gr.Markdown("# 🤖 Robot Data Collector & Trainer")
 
-            with gr.Row():
-                repo_id_input = gr.Textbox(label="Repo ID", value="test_dataset")
-                root_dir_input = gr.Textbox(label="Root Path", value=default_root_dir)
-                task_name_input = gr.Textbox(label="Task", value="test_task")
-                fps_input = gr.Number(label="FPS", value=30)
-                max_time_input = gr.Number(label="Max Time", value=0)
+            with gr.Tabs():
+                # 데이터 수집 탭
+                with gr.TabItem("데이터 수집"):
+                    with gr.Row():
+                        kinect_image = gr.Image(label="Kinect", type="numpy")
+                        wrist_image = gr.Image(label="Wrist", type="numpy")
 
-            init_btn = gr.Button("Initialize")
-            status_output = gr.Textbox(label="Status")
+                    with gr.Row():
+                        follower_joint_output = gr.Textbox(label="Follower Arm Joints")
+                        leader_joint_output = gr.Textbox(label="Leader Arm Joints")
 
-            with gr.Row():
-                record_btn = gr.Button("Record", variant="primary")
-                stop_btn = gr.Button("Stop", variant="stop")
+                    with gr.Row():
+                        repo_id_input = gr.Textbox(label="Repo ID", value="test_dataset")
+                        root_dir_input = gr.Textbox(label="Root Path", value=default_root_dir)
+                        task_name_input = gr.Textbox(label="Task", value="test_task")
+                        fps_input = gr.Number(label="FPS", value=30)
+                        max_time_input = gr.Number(label="Max Time", value=0)
 
-            init_btn.click(self.dataset_manager.init_dataset, [repo_id_input, root_dir_input, task_name_input, fps_input], status_output)
-            record_btn.click(self.dataset_manager.start_recording, [max_time_input], status_output)
-            stop_btn.click(self.dataset_manager.stop_recording, outputs=status_output)
+                    init_btn = gr.Button("Initialize")
+                    status_output = gr.Textbox(label="Status")
+
+                    with gr.Row():
+                        record_btn = gr.Button("Record", variant="primary")
+                        stop_btn = gr.Button("Stop", variant="stop")
+                        finalize_btn = gr.Button("데이터 수집 완료", variant="secondary")
+
+                    init_btn.click(self.dataset_manager.init_dataset, [repo_id_input, root_dir_input, task_name_input, fps_input], status_output)
+                    record_btn.click(self.dataset_manager.start_recording, [max_time_input], status_output)
+                    stop_btn.click(self.dataset_manager.stop_recording, outputs=status_output)
+                    finalize_btn.click(self.dataset_manager.finalize_dataset, outputs=status_output)
+
+                # 학습하기 탭
+                with gr.TabItem("학습하기"):
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("### 학습 파라미터 설정")
+                            train_repo_id = gr.Textbox(label="Dataset Repo ID", value="test_dataset")
+                            train_root_dir = gr.Textbox(label="Dataset Root Path", value=default_root_dir)
+                            policy_type = gr.Dropdown(label="Policy Type", choices=["act", "diffusion", "tdmpc"], value="act")
+                            output_dir = gr.Textbox(label="Output Directory", value="dataset/train/act_uon")
+                            batch_size = gr.Number(label="Batch Size", value=1)
+                            steps = gr.Number(label="Steps", value=50000)
+                            push_to_hub = gr.Checkbox(label="Push to Hub", value=False)
+
+                            with gr.Row():
+                                start_train_btn = gr.Button("학습 시작", variant="primary")
+                                stop_train_btn = gr.Button("학습 중단", variant="stop")
+
+                        with gr.Column():
+                            gr.Markdown("### 학습 상태 및 로그")
+                            train_status_display = gr.Textbox(label="현재 상태", value="대기 중")
+                            train_log_display = gr.TextArea(label="학습 로그", interactive=False, lines=20)
+
+                    start_train_btn.click(
+                        self.dataset_manager.start_training,
+                        [train_repo_id, train_root_dir, policy_type, output_dir, batch_size, steps, push_to_hub],
+                        status_output
+                    )
+                    stop_train_btn.click(self.dataset_manager.stop_training, outputs=status_output)
 
             timer = gr.Timer(value=self.update_interval)
-            timer.tick(self.ui_timer_callback, outputs=[kinect_image, wrist_image, follower_joint_output, leader_joint_output, status_output])
+            timer.tick(
+                self.ui_timer_callback,
+                outputs=[
+                    kinect_image, wrist_image, follower_joint_output, leader_joint_output,
+                    status_output, train_status_display, train_log_display
+                ]
+            )
+
         return demo
 
     def launch(self):
