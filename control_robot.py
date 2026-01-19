@@ -1,68 +1,79 @@
 import rclpy
 from rclpy.node import Node
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from rclpy.action import ActionClient
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
-class OmyF3MActionPublisher(Node):
+class TrajectoryActionClient(Node):
     def __init__(self):
-        super().__init__('omy_f3m_action_publisher')
+        super().__init__('trajectory_action_client')
+        # 1. 액션 클라이언트 생성
+        self._action_client = ActionClient(
+            self,
+            FollowJointTrajectory,
+            '/arm_controller2/follow_joint_trajectory'
+        )
 
-        # 1. 퍼블리셔 셋업 (YAML의 leader:/leader/joint_trajectory 반영)
-        self.joint_publishers = {
-            'leader': self.create_publisher(
-                JointTrajectory,
-                '/leader/joint_trajectory',
-                10
-            )
-        }
+    def send_goal(self, joint_names, positions):
+        # 액션 서버가 준비될 때까지 대기
+        if not self._action_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('액션 서버를 찾을 수 없습니다.')
+            return
 
-        # YAML에 정의된 관절 순서
-        self.joint_names = [
-            'joint1', 'joint2', 'joint3', 'joint4',
-            'joint5', 'joint6', 'rh_r1_joint'
-        ]
+        # 2. 목표(Goal) 메시지 구성
+        goal_msg = FollowJointTrajectory.Goal()
+        goal_msg.trajectory.joint_names = joint_names
 
-        self.get_logger().info('Omy_F3M 액션 퍼블리셔가 시작되었습니다.')
-
-        # 테스트용: 2초마다 동작 명령 실행
-        self.create_timer(10.0, self.test_publish)
-
-    def publish_action(self, joint_msg_datas):
-        """딕셔너리 기반 메시지 발행 (원본 코드 구조)"""
-        for name, joint_msg in joint_msg_datas.items():
-            if name in self.joint_publishers:
-                self.joint_publishers[name].publish(joint_msg)
-                print(f'{name}] 토픽으로 궤적을 전송했습니다.')
-
-    def test_publish(self):
-        # AI 모델에서 나온 결과값이라고 가정 (7개 관절의 목표 각도)
-        # 예: 모든 관절을 0.1 라디안으로 이동
-        target_positions = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-
-        # 2. JointTrajectory 메시지 구성
-        msg = JointTrajectory()
-        msg.joint_names = self.joint_names
-
+        # 3. 궤적 포인트(Point) 설정
         point = JointTrajectoryPoint()
-        point.positions = target_positions
-        point.time_from_start = Duration(sec=0, nanosec=100000000) # 0.1초 안에 도달 목표
+        point.positions = positions
+        # 시작 후 2초 안에 목표 도달하도록 설정
+        point.time_from_start = Duration(sec=2, nanosec=0)
 
-        msg.points.append(point)
+        goal_msg.trajectory.points = [point]
 
-        # 3. publish_action 호출을 위한 딕셔너리 포맷팅
-        action_data = {'leader': msg}
-        self.publish_action(action_data)
+        self.get_logger().info(f'목표 전송 중: {positions}')
+
+        # 4. 목표 전송 (비동기)
+        self._send_goal_future = self._action_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        self._send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('목표가 거절되었습니다.')
+            return
+
+        self.get_logger().info('목표가 수락되었습니다.')
+        self._get_result_future = goal_handle.get_result_async()
+        self._get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info('최종 결과 수신 완료')
+        # 종료 처리를 위해 rclpy.shutdown()을 호출하거나 추가 로직 작성
+
+    def feedback_callback(self, feedback_msg):
+        # 실제 로봇의 현재 상태를 피드백으로 받을 수 있음
+        # self.get_logger().info('피드백 수신 중...')
+        pass
 
 def main(args=None):
     rclpy.init(args=args)
-    node = OmyF3MActionPublisher()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    action_client = TrajectoryActionClient()
+
+    # 사용 중인 로봇의 실제 조인트 이름으로 변경해야 합니다.
+    joint_names = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6']
+    # 이동시키고 싶은 각도 (라디안 단위)
+    target_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    action_client.send_goal(joint_names, target_positions)
+
+    rclpy.spin(action_client)
 
 if __name__ == '__main__':
     main()

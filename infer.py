@@ -1,63 +1,48 @@
 #!/usr/bin/env python3
-#
-# Copyright 2025 ROBOTIS CO., LTD.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Author: Dongyun Kim
 
 import os
-
-from lerobot.policies.pretrained import PreTrainedPolicy
+import time
+import threading
 import numpy as np
-from file_utils import read_json_file
 import torch
+import cv2
 
+# ROS2 관련 임포트
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from sensor_msgs.msg import CompressedImage
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
 
+# 사용자 정의 모듈 (기존 파일들이 같은 경로에 있다고 가정)
+from lerobot.policies.pretrained import PreTrainedPolicy
+from file_utils import read_json_file
+from subscriber_hub import SubscriberHub
+from data_converter import decode_image
+
+# ==================================================================
+# 1. InferenceManager 클래스 (제공해주신 코드 유지)
+# ==================================================================
 class InferenceManager:
-
-    def __init__(
-            self,
-            device: str = 'cuda'):
-
+    def __init__(self, device: str = 'cuda'):
         self.device = device
         self.policy_type = None
         self.policy_path = None
         self.policy = None
 
     def validate_policy(self, policy_path: str) -> bool:
-        result_message = ''
         if not os.path.exists(policy_path) or not os.path.isdir(policy_path):
-            result_message = f'Policy path {policy_path} does not exist or is not a directory.'
-            return False, result_message
-
+            return False, f'Path {policy_path} not found.'
         config_path = os.path.join(policy_path, 'config.json')
         if not os.path.exists(config_path):
-            result_message = f'config.json file does not exist in {policy_path}.'
-            return False, result_message
-
+            return False, 'config.json missing.'
         config = read_json_file(config_path)
-        if (config is None or
-                ('type' not in config and 'model_type' not in config)):
-            result_message = f'config.json malformed or missing fields in {policy_path}.'
-            return False, result_message
-
-        available_policies = self.__class__.get_available_policies()
+        available_policies = self.get_available_policies()
         policy_type = config.get('type') or config.get('model_type')
         if policy_type not in available_policies:
-            result_message = f'Policy type {policy_type} is not supported.'
-            return False, result_message
-
+            return False, f'Unsupported policy: {policy_type}'
         self.policy_path = policy_path
         self.policy_type = policy_type
         return True, f'Policy {policy_type} is valid.'
@@ -66,281 +51,167 @@ class InferenceManager:
         try:
             policy_cls = self._get_policy_class(self.policy_type)
             self.policy = policy_cls.from_pretrained(self.policy_path)
+            self.policy.to(self.device)
+            self.policy.eval()
             return True
         except Exception as e:
-            print(f'Failed to load policy from {self.policy_path}: {e}')
+            print(f'Failed to load policy: {e}')
             return False
 
-    def clear_policy(self):
-        if hasattr(self, 'policy'):
-            del self.policy
-            self.policy = None
-        else:
-            print('No policy to clear.')
-
-    def get_policy_config(self):
-        return self.policy.config
-
-    def predict(
-            self,
-            images: dict[str, np.ndarray],
-            state: list[float],
-            task_instruction: str = None) -> list:
-
+    def predict(self, images: dict, state: list, task_instruction: str = None) -> list:
         observation = self._preprocess(images, state, task_instruction)
         with torch.inference_mode():
             action = self.policy.select_action(observation)
             action = action.squeeze(0).to('cpu').numpy()
-
         return action
 
-    def _preprocess(
-            self,
-            images: dict[str, np.ndarray],
-            state: list,
-            task_instruction: str = None) -> dict:
-
+    def _preprocess(self, images: dict, state: list, task_instruction: str = None) -> dict:
         observation = self._convert_images2tensors(images)
         observation['observation.state'] = self._convert_np2tensors(state)
         for key in observation.keys():
             observation[key] = observation[key].to(self.device)
-
         if task_instruction is not None:
             observation['task'] = [task_instruction]
-
         return observation
 
-    def _convert_images2tensors(
-            self,
-            images: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
-        """ Raw 이미지 데이터를 학습용 텐서로 변환 (numpy -> torch) """
-
+    def _convert_images2tensors(self, images: dict) -> dict:
         processed_images = {}
         for key, value in images.items():
-            image = torch.from_numpy(value)
-            image = image.to(torch.float32) / 255
-            image = image.permute(2, 0, 1)
-            image = image.to(self.device, non_blocking=True)
-            image = image.unsqueeze(0)
+            image = torch.from_numpy(value).to(torch.float32) / 255
+            image = image.permute(2, 0, 1).to(self.device).unsqueeze(0)
             processed_images['observation.images.' + key] = image
-
         return processed_images
 
-    def _convert_np2tensors(
-            self,
-            data):
-        """ numpy 데이터(센서, State)를 학습용 텐서로 변환 (numpy -> torch) """
-        if isinstance(data, list):
-            data = np.array(data)
-        tensor_data = torch.from_numpy(data)
-        tensor_data = tensor_data.to(torch.float32)
-        tensor_data = tensor_data.to(self.device, non_blocking=True)
-        tensor_data = tensor_data.unsqueeze(0)
+    def _convert_np2tensors(self, data):
+        if isinstance(data, list): data = np.array(data)
+        return torch.from_numpy(data).to(torch.float32).to(self.device).unsqueeze(0)
 
-        return tensor_data
-
-    def _get_policy_class(self, name: str) -> PreTrainedPolicy:
-        if name == 'tdmpc':
-            from lerobot.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
-
-            return TDMPCPolicy
-        elif name == 'diffusion':
-            from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-
-            return DiffusionPolicy
-        elif name == 'act':
-            from lerobot.policies.act.modeling_act import ACTPolicy
-
-            return ACTPolicy
-        elif name == 'vqbet':
-            from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
-
-            return VQBeTPolicy
-        elif name == 'pi0':
-            from lerobot.policies.pi0.modeling_pi0 import PI0Policy
-
-            return PI0Policy
-        elif name == 'pi0fast':
-            from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy
-            return PI0FASTPolicy
-        elif name == 'smolvla':
-            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-            return SmolVLAPolicy
-        # TODO: Uncomment when GrootN1Policy is implemented
-        # elif name == 'groot-n1':
-        #     from Isaac.groot_n1.policies.groot_n1 import GrootN1Policy
-        #     return GrootN1Policy
-        else:
-            raise NotImplementedError(
-                f'Policy with name {name} is not implemented.')
+    def _get_policy_class(self, name: str):
+        if name == 'act': from lerobot.policies.act.modeling_act import ACTPolicy; return ACTPolicy
+        elif name == 'diffusion': from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy; return DiffusionPolicy
+        # 추가 정책들은 필요시 여기에 추가
+        raise NotImplementedError(f'Policy {name} not implemented in this snippet.')
 
     @staticmethod
-    def get_available_policies() -> list[str]:
-        return [
-            'tdmpc',
-            'diffusion',
-            'act',
-            'vqbet',
-            'pi0',
-            'pi0fast',
-            'smolvla',
-        ]
+    def get_available_policies():
+        return ['tdmpc', 'diffusion', 'act', 'vqbet', 'pi0', 'pi0fast', 'smolvla']
 
-    @staticmethod
-    def get_saved_policies():
-        import os
-        import json
+    def clear_policy(self):
+        if hasattr(self, 'policy'): del self.policy; self.policy = None
 
-        home_dir = os.path.expanduser('~')
-        hub_dir = os.path.join(home_dir, '.cache/huggingface/hub')
-        models_folder_list = [d for d in os.listdir(hub_dir) if d.startswith('models--')]
-
-        saved_policy_path = []
-        saved_policy_type = []
-
-        for model_folder in models_folder_list:
-            model_path = os.path.join(hub_dir, model_folder)
-            snapshots_path = os.path.join(model_path, 'snapshots')
-
-            # Check if snapshots directory exists
-            if os.path.exists(snapshots_path) and os.path.isdir(snapshots_path):
-                # Get list of folders inside snapshots directory
-                snapshot_folders = [
-                    d for d in os.listdir(snapshots_path)
-                    if os.path.isdir(os.path.join(snapshots_path, d))
-                ]
-
-            # Check if pretrained_model folder exists in each snapshot folder
-            for snapshot_folder in snapshot_folders:
-                snapshot_path = os.path.join(snapshots_path, snapshot_folder)
-                pretrained_model_path = os.path.join(snapshot_path, 'pretrained_model')
-
-                # If pretrained_model folder exists, add to saved_policies
-                if os.path.exists(pretrained_model_path) and os.path.isdir(pretrained_model_path):
-                    config_path = os.path.join(pretrained_model_path, 'config.json')
-                    if os.path.exists(config_path):
-                        try:
-                            with open(config_path, 'r') as f:
-                                config = json.load(f)
-                                if 'type' in config:
-                                    saved_policy_path.append(pretrained_model_path)
-                                    saved_policy_type.append(config['type'])
-                                elif 'model_type' in config:
-                                    saved_policy_path.append(pretrained_model_path)
-                                    saved_policy_type.append(config['model_type'])
-                        except (json.JSONDecodeError, IOError):
-                            # If config.json cannot be read, store path only
-                            print('File IO Errors : ', IOError)
-
-        return saved_policy_path, saved_policy_type
-
-
-import cv2
-import threading
-import rclpy
-from sensor_msgs.msg import CompressedImage
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-
-from subscriber_hub import SubscriberHub
-from data_converter import decode_image
-
-import time # 상단에 import 추가
+# ==================================================================
+# 2. Main 실행 루프
+# ==================================================================
 def main():
-
     if not rclpy.ok():
         rclpy.init()
 
-    # 데이터 수집 쓰레드 시작
+    # --- ROS2 인프라 설정 ---
     hub = SubscriberHub()
-    threading.Thread(target=lambda: rclpy.spin(hub), daemon=True).start()
+    # SubscriberHub 스핀을 위한 별도 쓰레드
+    spin_thread = threading.Thread(target=lambda: rclpy.spin(hub), daemon=True)
+    spin_thread.start()
 
+    # 액션 클라이언트를 위한 임시 노드 생성
+    action_node = rclpy.create_node('inference_action_client')
+    action_client = ActionClient(
+        action_node,
+        FollowJointTrajectory,
+        '/arm_controller2/follow_joint_trajectory'
+    )
 
-    def get_latest_data():
-        kinect_msg, right_wrist_cam_msg, right_follower_msg, _ = hub.get_latest_msg()
-
-        # 디코딩
-        kinect_img = decode_image(kinect_msg)
-        right_wrist_img = decode_image(right_wrist_cam_msg)
-
-        # JointStates -> np.array(7)
-        follower_joint_data = np.array(right_follower_msg.position, dtype=np.float32)
-
-        return kinect_img, right_wrist_img, follower_joint_data
-
-
-
-    # 1. Inference Manager 초기화
-    inference_manager = InferenceManager(device='cuda')
-
-    # 2. 모델 파일 설정 및 로드
-    POLICY_PATH = "/home/jusik/TEST/test_download-dataset/model"
-    is_valid, message = inference_manager.validate_policy(POLICY_PATH)
-    print(f"모델 유효성 검사 결과: {is_valid}, 메시지: {message}")
-
-    if not is_valid or not inference_manager.load_policy():
-        print("모델 로드 실패로 종료합니다.")
+    print("기다리는 중: 액션 서버...")
+    if not action_client.wait_for_server(timeout_sec=10.0):
+        print("에러: 액션 서버를 찾을 수 없습니다.")
         return
 
-    # ==================================================================
-    # 30 FPS 루프 설정
-    # ==================================================================
-    target_fps = 30
-    target_period = 1.0 / target_fps  # 약 0.0333초
+    # [중요] 로봇의 실제 조인트 이름 리스트 (자신의 로봇 설정에 맞게 수정)
+    JOINT_NAMES = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6']
 
-    print(f"\n[시작] {target_fps} FPS 주기로 추론을 시작합니다.")
+    # --- 모델 로드 ---
+    inference_manager = InferenceManager(device='cuda')
+    POLICY_PATH = "/home/uon/workspace/jusik_dataset/dataset/train/act_uon/checkpoints/last/pretrained_model"
+
+    is_valid, message = inference_manager.validate_policy(POLICY_PATH)
+    print(f"모델 검사: {message}")
+
+    if not is_valid or not inference_manager.load_policy():
+        print("모델 로드 실패.")
+        return
+
+    # --- 제어 루프 설정 (10 FPS) ---
+    target_fps = 10
+    target_period = 1.0 / target_fps
+    print(f"\n[시작] {target_fps} FPS 주기로 제어를 시작합니다.")
 
     try:
-        while True:
-            start_time = time.perf_counter() # 고정밀 타이머 시작
+        while rclpy.ok():
+            start_time = time.perf_counter()
 
-            # 1) 실시간 데이터 가져오기
-            kinect_image, wrist_image, follower_joint_data = get_latest_data()
+            # 1) 최신 데이터 수집
+            kinect_msg, wrist_cam_msg, follower_msg, _ = hub.get_latest_msg()
 
-
-            # 데이터가 아직 안 들어왔을 경우 처리
-            if kinect_image is None:
-                # print("데이터 대기 중...")
+            if kinect_msg is None or follower_msg is None:
+                # 데이터가 올 때까지 아주 짧게 대기
                 time.sleep(0.01)
                 continue
 
-            # 2) 입력 데이터 구성 (실제 데이터로 교체)
-            input_images = {
-                'cam_top': kinect_image, # 예시 해상도
-                'right_cam_wrist': wrist_image, # 임시
-            }
+            # 2) 데이터 전처리 (디코딩 및 변환)
+            kinect_img = decode_image(kinect_msg)
+            wrist_img = decode_image(wrist_cam_msg)
 
-            # 현재 조인트 데이터 (실제 로봇 상태 데이터로 교체 필요)
-            input_state = follower_joint_data
-            input_instruction = "pick the zipper bag"
+            total_joint_order = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6', 'right_rh_r1_joint']
+            state_dict = dict(zip(follower_msg.name, follower_msg.position))
+            current_states = np.array([state_dict[name] for name in total_joint_order], dtype=np.float32)
 
             # 3) 모델 추론
+            input_images = {
+                'cam_top': kinect_img,
+                'cam_wrist': wrist_img,
+            }
+
             predicted_action = inference_manager.predict(
                 images=input_images,
-                state=input_state.tolist(),
-                task_instruction=input_instruction
+                state=current_states.tolist(),
+                task_instruction="pick the zipper bag"
             )
 
-            # 4) 결과 출력 (또는 액션 서버 전송)
+            # 4) 액션 서버로 명령 전송 (비동기)
             if predicted_action is not None:
-                print(f"Action: {predicted_action}")
-                pass
+                goal_msg = FollowJointTrajectory.Goal()
+                goal_msg.trajectory.joint_names = JOINT_NAMES
 
-            # 5) 30 FPS 유지를 위한 정밀 대기
-            elapsed_time = time.perf_counter() - start_time
-            sleep_time = target_period - elapsed_time
+                point = JointTrajectoryPoint()
+                # 추론된 액션 값 적용 (조인트 개수에 맞춰 슬라이싱)
+                point.positions = predicted_action.tolist()[:len(JOINT_NAMES)]
 
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                # 10FPS 주기에 맞춰 1초 내에 도달하도록 설정
+                point.time_from_start = Duration(sec=0, nanosec=500000000)
+
+                goal_msg.trajectory.points = [point]
+
+                # 결과를 기다리지 않고(Non-blocking) 다음 루프로 바로 넘어감
+                action_client.send_goal_async(goal_msg)
+
+                # 디버깅 출력 (주기가 빠르므로 필요시 주석 처리)
+                print(f"Sent Action: {point.positions}")
+
+            # 5) 주기 유지를 위한 정밀 대기
+            elapsed = time.perf_counter() - start_time
+            remaining = target_period - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
             else:
-                # 추론 시간이 1/30초를 초과한 경우 경고
-                fps_actual = 1.0 / (time.perf_counter() - start_time)
-                print(f"Warning: Inference slow! Actual FPS: {fps_actual:.2f}")
+                print(f"Warning: 루프 지연 발생! 현재 속도: {1.0/elapsed:.2f} FPS")
 
     except KeyboardInterrupt:
-        print("\n사용자에 의해 중단되었습니다.")
+        print("\n사용자에 의해 중단됨.")
     finally:
+        # 리소스 정리
         inference_manager.clear_policy()
-        print("리소스 정리 완료.")
+        action_node.destroy_node()
+        hub.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
