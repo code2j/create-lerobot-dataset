@@ -133,18 +133,15 @@ def main():
     spin_thread = threading.Thread(target=lambda: rclpy.spin(hub), daemon=True)
     spin_thread.start()
 
-    # --- 퍼블리셔 노드 설정 ---
+    # --- 로봇 제어 노드 설정 ---
     node = rclpy.create_node('inference_publisher_node')
-
-    # [수정] 액션 클라이언트 대신 퍼블리셔 생성
-    # 토픽 풀네임: /right_robot/leader/joint_trajectory
     joint_pub = node.create_publisher(
         JointTrajectory,
         '/right_robot/leader/joint_trajectory',
         10
     )
 
-    # 제어 대상 조인트 리스트 (기존 로그 데이터 기반)
+    # --- 제어 대상 조인트 리스트 ---
     TOTAL_JOINT_NAMES = [
         'right_joint1', 'right_joint2', 'right_joint3',
         'right_joint4', 'right_joint5', 'right_joint6',
