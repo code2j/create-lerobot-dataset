@@ -336,7 +336,6 @@ def main():
                 continue
 
             # 2) 입력 데이터 구성 (실제 데이터로 교체)
-            # 주의: 모델이 요구하는 해상도로 resize가 필요할 수 있습니다.
             input_images = {
                 'cam_top': cv2.resize(kinect_image, (1280, 720, 3)), # 예시 해상도
                 'right_cam_wrist': np.random.randint(0, 256, size=(848, 480, 3), dtype=np.uint8), # 임시
@@ -367,7 +366,7 @@ def main():
             else:
                 # 추론 시간이 1/30초를 초과한 경우 경고
                 fps_actual = 1.0 / (time.perf_counter() - start_time)
-                # print(f"Warning: Inference slow! Actual FPS: {fps_actual:.2f}")
+                print(f"Warning: Inference slow! Actual FPS: {fps_actual:.2f}")
 
     except KeyboardInterrupt:
         print("\n사용자에 의해 중단되었습니다.")
