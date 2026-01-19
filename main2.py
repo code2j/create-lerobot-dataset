@@ -53,7 +53,7 @@ class Dataset_manager:
         self.consumer_thread = threading.Thread(target=self._consumer_loop, daemon=True)
         self.consumer_thread.start()
 
-        print("[Info ] 녹화 및 소비자 쓰레드가 시작되었습니다.")
+        print("[Info ] 녹화 및 소비자 쓰레드가 시작")
 
     def init_dataset(self, repo_id, root_dir, task_name, fps) -> str:
         """데이터셋 초기화 및 생성"""
@@ -94,8 +94,6 @@ class Dataset_manager:
                 use_videos=True,
                 fps=fps,
                 robot_type="omy_f3m",
-                image_writer_processes=2,
-                image_writer_threads=4,
             )
 
             print(f"[Info ] 데이터셋이 성공적으로 초기화되었습니다.")
@@ -169,8 +167,9 @@ class Dataset_manager:
             except Exception as e:
                 print(f"[Error] 소비자 루프 오류: {e}")
 
+
     def toggle_recording(self, max_time=0):
-        """스페이스바 단축키를 위한 토글 기능"""
+        """스페이스바 단축키를 위한 토글 기능: 상태에 따라 분기"""
         if self.is_recording:
             return self.stop_recording()
         else:
@@ -180,11 +179,14 @@ class Dataset_manager:
         if self.dataset is None:
             return "오류: 데이터셋이 초기화되지 않았습니다."
 
+        if self.is_recording:
+            return "시스템: 이미 녹화 중입니다."
+
         self.max_record_time = max_time
         self.start_time = time.time()
         self.is_recording = True
 
-        msg = "시스템: 녹화를 시작합니다."
+        msg = "시스템: 녹화를 시작합니다. (Space 키로 중단 가능)"
         print(msg)
         return msg
 
@@ -197,8 +199,9 @@ class Dataset_manager:
         # 백그라운드에서 큐가 비워지면 저장하도록 함
         threading.Thread(target=self._wait_and_save, daemon=True).start()
 
-        print("시스템: 녹화가 중단되었습니다. 백그라운드에서 저장을 진행합니다.")
-        return "시스템: 녹화 중단 (백그라운드 저장 중)"
+        msg = "시스템: 녹화 중단 (백그라운드 저장 중)"
+        print(msg)
+        return msg
 
     def _wait_and_save(self):
         """백그라운드에서 큐가 비워질 때까지 기다린 후 저장"""
@@ -280,17 +283,17 @@ class GradioVisualizer:
     def create_interface(self):
         default_root_dir = os.path.join(os.getcwd(), "dataset")
 
-        # 스페이스바 감지를 위한 JavaScript (Gradio 6.0+ 호환성 고려)
+        # 스페이스바 감지를 위한 JavaScript
         js_code = """
         function() {
             document.addEventListener('keydown', function(e) {
                 if (e.code === 'Space') {
-                    // 입력창(Textbox, Number 등)에 포커스가 있을 때는 동작하지 않도록 방지
                     const active = document.activeElement;
                     if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable) {
                         return;
                     }
                     e.preventDefault();
+                    // 숨겨진 토글 버튼을 클릭하게 함
                     const btn = document.getElementById('toggle_btn');
                     if (btn) btn.click();
                 }
@@ -320,21 +323,22 @@ class GradioVisualizer:
             status_output = gr.Textbox(label="Status")
 
             with gr.Row():
-                record_btn = gr.Button("Record (Space)", variant="primary")
-                stop_btn = gr.Button("Stop (Space)", variant="stop")
-                finalize_btn = gr.Button("데이터 수집 완료", variant="secondary")
+                # 버튼 이름을 명확하게 수정
+                record_btn = gr.Button("Record", variant="primary")
+                stop_btn = gr.Button("Stop", variant="stop")
+                finalize_btn = gr.Button("데이터 수집 완료 (Finalize)", variant="secondary")
 
-            # 단축키용 숨겨진 버튼
+            # 스페이스바 전용 숨겨진 버튼 (UI에는 보이지 않음)
             toggle_btn = gr.Button("Toggle Recording", visible=False, elem_id="toggle_btn")
 
             init_btn.click(self.dataset_manager.init_dataset, [repo_id_input, root_dir_input, task_name_input, fps_input], status_output)
 
-            # 버튼 클릭 이벤트들
+            # 명시적 버튼 이벤트
             record_btn.click(self.dataset_manager.start_recording, [max_time_input], status_output)
             stop_btn.click(self.dataset_manager.stop_recording, outputs=status_output)
             finalize_btn.click(self.dataset_manager.finalize_dataset, outputs=status_output)
 
-            # 스페이스바 토글 이벤트
+            # 스페이스바 토글 이벤트 (상태에 따라 자동 분기)
             toggle_btn.click(self.dataset_manager.toggle_recording, [max_time_input], status_output)
 
             timer = gr.Timer(value=self.update_interval)
@@ -346,19 +350,24 @@ class GradioVisualizer:
                 ]
             )
 
-            # Gradio 6.0+ 에서는 launch(js=...) 형식을 권장하므로 demo 객체에 js 속성을 저장해둡니다.
             self.js_code = js_code
 
         return demo
 
     def launch(self):
         demo = self.create_interface()
-        # Gradio 6.0+ 경고를 해결하기 위해 launch에 js를 전달합니다.
         demo.launch(server_name="0.0.0.0", server_port=7860, js=self.js_code)
 
 if __name__ == "__main__":
     import rclpy
     rclpy.init()
     hub = SubscriberHub()
+    # ROS2 Spin을 별도 쓰레드에서 실행
     threading.Thread(target=lambda: rclpy.spin(hub), daemon=True).start()
-    GradioVisualizer(hub).launch()
+
+    visualizer = GradioVisualizer(hub)
+    try:
+        visualizer.launch()
+    except KeyboardInterrupt:
+        visualizer.dataset_manager.close()
+        rclpy.shutdown()

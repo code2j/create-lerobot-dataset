@@ -1,29 +1,52 @@
-#!/usr/bin/env python3
-
 import os
 import time
 import threading
 import numpy as np
 import torch
 import cv2
+from typing import Dict, List, Any
 
 # ROS2 관련 임포트
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
 from sensor_msgs.msg import CompressedImage
-from control_msgs.action import FollowJointTrajectory
-from trajectory_msgs.msg import JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
-# 사용자 정의 모듈 (기존 파일들이 같은 경로에 있다고 가정)
+# 사용자 정의 모듈
 from lerobot.policies.pretrained import PreTrainedPolicy
 from file_utils import read_json_file
 from subscriber_hub import SubscriberHub
 from data_converter import decode_image
 
+
+
+def tensor_array2joint_msgs(action, joint_names):
+    """
+    Twist 제거 버전: action 텐서를 JointTrajectory 메시지로 변환
+    """
+    msg = JointTrajectory()
+    msg.joint_names = joint_names
+
+    # 만약 action이 (Time_Step, Joint_Dim) 형태라면 첫 번째 액션만 사용
+    if action.ndim > 1:
+        target_positions = action[0].tolist()
+    else:
+        target_positions = action.tolist()
+
+    point = JointTrajectoryPoint()
+    point.positions = [float(p) for p in target_positions] # 명시적 float 형변환
+
+    # 제어기가 부드럽게 동작하도록 시간 간격 설정 (예: 0.1초 내 도달)
+    point.time_from_start.sec = 0
+    point.time_from_start.nanosec = 100_000_000 # 100ms
+
+    msg.points = [point]
+    return msg
+
+
 # ==================================================================
-# 1. InferenceManager 클래스 (제공해주신 코드 유지)
+# 1. InferenceManager 클래스 (기존 로직 유지)
 # ==================================================================
 class InferenceManager:
     def __init__(self, device: str = 'cuda'):
@@ -89,8 +112,7 @@ class InferenceManager:
     def _get_policy_class(self, name: str):
         if name == 'act': from lerobot.policies.act.modeling_act import ACTPolicy; return ACTPolicy
         elif name == 'diffusion': from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy; return DiffusionPolicy
-        # 추가 정책들은 필요시 여기에 추가
-        raise NotImplementedError(f'Policy {name} not implemented in this snippet.')
+        raise NotImplementedError(f'Policy {name} not implemented.')
 
     @staticmethod
     def get_available_policies():
@@ -100,37 +122,38 @@ class InferenceManager:
         if hasattr(self, 'policy'): del self.policy; self.policy = None
 
 # ==================================================================
-# 2. Main 실행 루프
+# 2. Main 실행 루프 (Topic Publisher 방식)
 # ==================================================================
 def main():
     if not rclpy.ok():
         rclpy.init()
 
-    # --- ROS2 인프라 설정 ---
+    # --- ROS2 허브 설정 ---
     hub = SubscriberHub()
-    # SubscriberHub 스핀을 위한 별도 쓰레드
     spin_thread = threading.Thread(target=lambda: rclpy.spin(hub), daemon=True)
     spin_thread.start()
 
-    # 액션 클라이언트를 위한 임시 노드 생성
-    action_node = rclpy.create_node('inference_action_client')
-    action_client = ActionClient(
-        action_node,
-        FollowJointTrajectory,
-        '/arm_controller2/follow_joint_trajectory'
+    # --- 퍼블리셔 노드 설정 ---
+    node = rclpy.create_node('inference_publisher_node')
+
+    # [수정] 액션 클라이언트 대신 퍼블리셔 생성
+    # 토픽 풀네임: /right_robot/leader/joint_trajectory
+    joint_pub = node.create_publisher(
+        JointTrajectory,
+        '/right_robot/leader/joint_trajectory',
+        10
     )
 
-    print("기다리는 중: 액션 서버...")
-    if not action_client.wait_for_server(timeout_sec=10.0):
-        print("에러: 액션 서버를 찾을 수 없습니다.")
-        return
-
-    # [중요] 로봇의 실제 조인트 이름 리스트 (자신의 로봇 설정에 맞게 수정)
-    JOINT_NAMES = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6']
+    # 제어 대상 조인트 리스트 (기존 로그 데이터 기반)
+    TOTAL_JOINT_NAMES = [
+        'right_joint1', 'right_joint2', 'right_joint3',
+        'right_joint4', 'right_joint5', 'right_joint6',
+        'right_rh_r1_joint'
+    ]
 
     # --- 모델 로드 ---
     inference_manager = InferenceManager(device='cuda')
-    POLICY_PATH = "/home/uon/workspace/jusik_dataset/dataset/train/act_uon/checkpoints/last/pretrained_model"
+    POLICY_PATH = "/home/uon/workspace/create-lerobot-dataset-master/dataset/train/act_uon/checkpoints/last/pretrained_model"
 
     is_valid, message = inference_manager.validate_policy(POLICY_PATH)
     print(f"모델 검사: {message}")
@@ -140,9 +163,9 @@ def main():
         return
 
     # --- 제어 루프 설정 (10 FPS) ---
-    target_fps = 10
+    target_fps = 30
     target_period = 1.0 / target_fps
-    print(f"\n[시작] {target_fps} FPS 주기로 제어를 시작합니다.")
+    print(f"\n[시작] 토픽 발행 방식으로 제어를 시작합니다. (주기: {target_fps}Hz)")
 
     try:
         while rclpy.ok():
@@ -152,17 +175,16 @@ def main():
             kinect_msg, wrist_cam_msg, follower_msg, _ = hub.get_latest_msg()
 
             if kinect_msg is None or follower_msg is None:
-                # 데이터가 올 때까지 아주 짧게 대기
                 time.sleep(0.01)
                 continue
 
-            # 2) 데이터 전처리 (디코딩 및 변환)
+            # 2) 전처리
             kinect_img = decode_image(kinect_msg)
             wrist_img = decode_image(wrist_cam_msg)
 
-            total_joint_order = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6', 'right_rh_r1_joint']
+            # Follower 상태를 학습 모델 순서에 맞춤
             state_dict = dict(zip(follower_msg.name, follower_msg.position))
-            current_states = np.array([state_dict[name] for name in total_joint_order], dtype=np.float32)
+            current_states = np.array([state_dict[name] for name in TOTAL_JOINT_NAMES], dtype=np.float32)
 
             # 3) 모델 추론
             input_images = {
@@ -176,40 +198,29 @@ def main():
                 task_instruction="pick the zipper bag"
             )
 
-            # 4) 액션 서버로 명령 전송 (비동기)
+            # 4) [수정] JointTrajectory 메시지 생성 및 발행
             if predicted_action is not None:
-                goal_msg = FollowJointTrajectory.Goal()
-                goal_msg.trajectory.joint_names = JOINT_NAMES
+                # 헤더에 현재 시간 추가 (메시지 수신 측에서 지연 판단용)
+                msg = tensor_array2joint_msgs(predicted_action, TOTAL_JOINT_NAMES)
+                msg.header.stamp = node.get_clock().now().to_msg()
 
-                point = JointTrajectoryPoint()
-                # 추론된 액션 값 적용 (조인트 개수에 맞춰 슬라이싱)
-                point.positions = predicted_action.tolist()[:len(JOINT_NAMES)]
+                # 토픽 발행
+                joint_pub.publish(msg)
 
-                # 10FPS 주기에 맞춰 1초 내에 도달하도록 설정
-                point.time_from_start = Duration(sec=0, nanosec=500000000)
+                # [수정] 디버깅 출력: msg에서 직접 값을 가져오도록 변경
+                print(f"Published Joint States: {np.round(msg.points[0].positions, 4)}")
 
-                goal_msg.trajectory.points = [point]
-
-                # 결과를 기다리지 않고(Non-blocking) 다음 루프로 바로 넘어감
-                action_client.send_goal_async(goal_msg)
-
-                # 디버깅 출력 (주기가 빠르므로 필요시 주석 처리)
-                print(f"Sent Action: {point.positions}")
-
-            # 5) 주기 유지를 위한 정밀 대기
+            # 5) 주기 유지
             elapsed = time.perf_counter() - start_time
             remaining = target_period - elapsed
             if remaining > 0:
                 time.sleep(remaining)
-            else:
-                print(f"Warning: 루프 지연 발생! 현재 속도: {1.0/elapsed:.2f} FPS")
 
     except KeyboardInterrupt:
-        print("\n사용자에 의해 중단됨.")
+        print("\n중단됨.")
     finally:
-        # 리소스 정리
         inference_manager.clear_policy()
-        action_node.destroy_node()
+        node.destroy_node()
         hub.destroy_node()
         rclpy.shutdown()
 

@@ -3,6 +3,13 @@
 lerobot-dataset-viz     --repo-id uon/multi-cam-joint-task     --root outputs/uon/multi-cam-joint-task     --episode-index 1
 ```
 
+해당 데이터셋 안에서 사용하면 됨
+```shell
+cd dataset/uon/test_dataset
+lerobot-dataset-viz --root . --repo-id test_dataset --episode-index 0
+```
+
+
 ### 모델 학습 명령어
 ```shell
 lerobot-train \
