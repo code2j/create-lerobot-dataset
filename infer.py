@@ -299,82 +299,81 @@ def get_right_wrist_data(topic_name):
     return KinectSingleton().get_latest(topic_name)
 
 
-
+import time # 상단에 import 추가
 def main():
-    # # ==================================================================
-    # Infernce 테스트
-    # # ==================================================================
+    # 1. Inference Manager 초기화
     inference_manager = InferenceManager(device='cuda')
 
-
-    # ==================================================================
-    # 2. 모델 파일 설정
-    # ==================================================================
+    # 2. 모델 파일 설정 및 로드
     POLICY_PATH = "/home/jusik/TEST/test_download-dataset/model"
-    if not os.path.exists(POLICY_PATH):
-        print(f"\n오류: 지정된 경로를 찾을 수 없습니다: {POLICY_PATH}")
-
-
-    # 모델 유효성 검사
     is_valid, message = inference_manager.validate_policy(POLICY_PATH)
     print(f"모델 유효성 검사 결과: {is_valid}, 메시지: {message}")
 
-    if not is_valid:
-        print("유효하지 않은 모델이므로 프로그램 종료됨")
-        return
-
-    # 설정: 검증된 모델을 메모리에 로드합니다.
-    if not inference_manager.load_policy():
-        print("모델 로드에 실패하여 테스트를 중단합니다.")
+    if not is_valid or not inference_manager.load_policy():
+        print("모델 로드 실패로 종료합니다.")
         return
 
     # ==================================================================
-    # 3. 입력 데이터 설정
+    # 30 FPS 루프 설정
     # ==================================================================
-    while True:
-        kinect_image = get_kinect_data('/kinect/color/compressed')
-        # right_wrist_image = get_right_wrist_data('right/') # TODO
+    target_fps = 30
+    target_period = 1.0 / target_fps  # 약 0.0333초
 
-        # 키넥트 토픽 데이터 디버깅 코드
-        # if kinect_image is not None:
-        #     print(f"Type: {type(kinect_image)}")      # <class 'numpy.ndarray'>
-        #     print(f"Shape: {kinect_image.shape}")     # (720, 1280, 3) 등
-        #     print(f"Dtype: {kinect_image.dtype}")     # uint8
+    print(f"\n[시작] {target_fps} FPS 주기로 추론을 시작합니다.")
 
-        # 영상 데이터
-        input_images = {
-            'right_cam_wrist': np.random.randint(0, 256, size=(848, 480, 3), dtype=np.uint8),
-            'cam_top': np.random.randint(0, 256, size=(1280, 720, 3), dtype=np.uint8)
-        }
-        # 현제 조인트 데이터
-        input_state = np.random.rand(7).astype(np.float32)
+    try:
+        while True:
+            start_time = time.perf_counter() # 고정밀 타이머 시작
 
-        # 명령어
-        input_instruction = "블록 밀기"
+            # 1) 실시간 데이터 가져오기
+            kinect_image = get_kinect_data('/kinect/color/compressed')
+            # right_wrist_image = get_right_wrist_data('/right_wrist/color/compressed')
 
+            # 데이터가 아직 안 들어왔을 경우 처리
+            if kinect_image is None:
+                # print("데이터 대기 중...")
+                time.sleep(0.01)
+                continue
 
-        # ==================================================================
-        # 4. 모델 추론
-        # ==================================================================
-        predicted_action = inference_manager.predict(
-            images=input_images,
-            state=input_state.tolist(),
-            task_instruction=input_instruction
-        )
+            # 2) 입력 데이터 구성 (실제 데이터로 교체)
+            # 주의: 모델이 요구하는 해상도로 resize가 필요할 수 있습니다.
+            input_images = {
+                'cam_top': cv2.resize(kinect_image, (1280, 720, 3)), # 예시 해상도
+                'right_cam_wrist': np.random.randint(0, 256, size=(848, 480, 3), dtype=np.uint8), # 임시
+            }
 
+            # 현재 조인트 데이터 (실제 로봇 상태 데이터로 교체 필요)
+            input_state = np.random.rand(7).astype(np.float32)
+            input_instruction = "pick the zipper bag"
 
-        # TODO: 결과를 엑션 서버에 보내 줘야함...
-        if predicted_action is not None:
-            pass
-            print("\n--- 추론 결과 ---")
-            print(f"예측된 행동: {predicted_action}")
+            # 3) 모델 추론
+            predicted_action = inference_manager.predict(
+                images=input_images,
+                state=input_state.tolist(),
+                task_instruction=input_instruction
+            )
 
-    # Inference manager 리소스 정리
-    inference_manager.clear_policy()
+            # 4) 결과 출력 (또는 액션 서버 전송)
+            if predicted_action is not None:
+                # print(f"Action: {predicted_action}")
+                pass
 
-    print("\n 끝")
+            # 5) 30 FPS 유지를 위한 정밀 대기
+            elapsed_time = time.perf_counter() - start_time
+            sleep_time = target_period - elapsed_time
 
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # 추론 시간이 1/30초를 초과한 경우 경고
+                fps_actual = 1.0 / (time.perf_counter() - start_time)
+                # print(f"Warning: Inference slow! Actual FPS: {fps_actual:.2f}")
 
+    except KeyboardInterrupt:
+        print("\n사용자에 의해 중단되었습니다.")
+    finally:
+        inference_manager.clear_policy()
+        print("리소스 정리 완료.")
 
 if __name__ == '__main__':
     main()
