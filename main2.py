@@ -136,7 +136,7 @@ class Dataset_manager:
                 next_time = time.time()
 
     def _consumer_loop(self):
-        """소비자: 큐에서 데이터를 꺼내 무거운 작업 수행"""
+        """큐에서 데이터를 꺼내 작업 수행(디코딩 및 변환)"""
         while self.running:
             try:
                 raw_data = self.data_queue.get(timeout=0.1)
@@ -170,7 +170,6 @@ class Dataset_manager:
             return "오류: 데이터셋이 초기화되지 않았습니다."
 
         # 즉시 다음 녹화가 가능하도록 큐를 비우지 않고 상태만 변경
-        # (이전 녹화 데이터는 소비자 쓰레드가 백그라운드에서 계속 처리 중)
         self.max_record_time = max_time
         self.start_time = time.time()
         self.is_recording = True
