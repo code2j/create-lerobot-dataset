@@ -119,7 +119,7 @@ class Dataset_manager:
                         continue
 
                 # 1. 데이터 수집
-                raw_data = self.subscriber_hub.get_latest_data()
+                raw_data = self.subscriber_hub.get_latest_msg()
 
                 # 2. 큐에 삽입 (에피소드 구분을 위해 현재 에피소드 인덱스 포함 가능)
                 self.data_queue.put(raw_data)
@@ -315,7 +315,7 @@ class GradioVisualizer:
         self.dataset_manager = Dataset_manager(self.subscriber_hub)
 
     def ui_timer_callback(self):
-        (k_msg, w_msg, f_joint, l_joint) = self.subscriber_hub.get_latest_data()
+        (k_msg, w_msg, f_joint, l_joint) = self.subscriber_hub.get_latest_msg()
         k_img = decode_image(k_msg)
         w_img = decode_image(w_msg)
 

@@ -63,14 +63,14 @@ class SubscriberHub(Node):
         """오른쪽 리더 로봇 조인트 토픽 콜백"""
         self.right_leader_topic_msg = msg
 
-    def get_latest_data(self):
+    def get_latest_msg(self):
         """가장 최신의 데이터 리턴"""
         return (self.kinect_topic_msg,
                 self.right_wristCame_topic_msg,
                 self.right_follower_topic_msg,
                 self.right_leader_topic_msg)
 
-    def clear_latest_data(self):
+    def clear_latest_msg(self):
         """모든 토픽 데이터 초기화"""
         self.kinect_topic_msg = None
         self.right_wristCame_topic_msg = None
