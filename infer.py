@@ -241,66 +241,34 @@ import rclpy
 from sensor_msgs.msg import CompressedImage
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-class KinectSingleton:
-    _instance = None
-    _lock = threading.Lock()
-
-    def __new__(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(KinectSingleton, cls).__new__(cls)
-                cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(self):
-        if self._initialized: return
-
-        if not rclpy.ok(): rclpy.init()
-        self.node = rclpy.create_node('kinect_subscriber')
-        self.images = {}  # 여러 토픽에 대응할 수 있도록 딕셔너리 사용
-        self.data_lock = threading.Lock()
-
-        # 백그라운드 스핀 시작
-        self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
-        self.spin_thread.start()
-        self._initialized = True
-
-    def subscribe_topic(self, topic_name):
-        """특정 토픽을 처음 호출할 때만 구독 생성"""
-        with self.data_lock:
-            if topic_name not in self.images:
-                self.images[topic_name] = None
-                self.node.create_subscription(
-                    CompressedImage,
-                    topic_name,
-                    lambda msg: self._callback(msg, topic_name),
-                    QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=1)
-                )
-
-    def _callback(self, msg, topic_name):
-        np_arr = np.frombuffer(msg.data, np.uint8)
-        cv_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        with self.data_lock:
-            self.images[topic_name] = cv_img
-
-    def get_latest(self, topic_name):
-        self.subscribe_topic(topic_name) # 아직 구독 전이면 구독 시작
-        with self.data_lock:
-            return self.images.get(topic_name)
-
-
-
-def get_kinect_data(topic_name: str):
-    """키넥트 데이터를 가져옴"""
-    return KinectSingleton().get_latest(topic_name)
-
-def get_right_wrist_data(topic_name):
-    """오른쪽 손목 카메라 데이터를 가져옴"""
-    return KinectSingleton().get_latest(topic_name)
-
+from subscriber_hub import SubscriberHub
+from data_converter import decode_image
 
 import time # 상단에 import 추가
 def main():
+
+    if not rclpy.ok():
+        rclpy.init()
+
+    # 데이터 수집 쓰레드 시작
+    hub = SubscriberHub()
+    threading.Thread(target=lambda: rclpy.spin(hub), daemon=True).start()
+
+
+    def get_latest_data():
+        kinect_msg, right_wrist_cam_msg, right_follower_msg, _ = hub.get_latest_msg()
+
+        # 디코딩
+        kinect_img = decode_image(kinect_msg)
+        right_wrist_img = decode_image(right_wrist_cam_msg)
+
+        # JointStates -> np.array(7)
+        follower_joint_data = np.array(right_follower_msg.position, dtype=np.float32)
+
+        return kinect_img, right_wrist_img, follower_joint_data
+
+
+
     # 1. Inference Manager 초기화
     inference_manager = InferenceManager(device='cuda')
 
@@ -326,8 +294,8 @@ def main():
             start_time = time.perf_counter() # 고정밀 타이머 시작
 
             # 1) 실시간 데이터 가져오기
-            kinect_image = get_kinect_data('/kinect/color/compressed')
-            # right_wrist_image = get_right_wrist_data('/right_wrist/color/compressed')
+            kinect_image, wrist_image, follower_joint_data = get_latest_data()
+
 
             # 데이터가 아직 안 들어왔을 경우 처리
             if kinect_image is None:
@@ -337,12 +305,12 @@ def main():
 
             # 2) 입력 데이터 구성 (실제 데이터로 교체)
             input_images = {
-                'cam_top': cv2.resize(kinect_image, (1280, 720, 3)), # 예시 해상도
-                'right_cam_wrist': np.random.randint(0, 256, size=(848, 480, 3), dtype=np.uint8), # 임시
+                'cam_top': kinect_image, # 예시 해상도
+                'right_cam_wrist': wrist_image, # 임시
             }
 
             # 현재 조인트 데이터 (실제 로봇 상태 데이터로 교체 필요)
-            input_state = np.random.rand(7).astype(np.float32)
+            input_state = follower_joint_data
             input_instruction = "pick the zipper bag"
 
             # 3) 모델 추론
@@ -354,7 +322,7 @@ def main():
 
             # 4) 결과 출력 (또는 액션 서버 전송)
             if predicted_action is not None:
-                # print(f"Action: {predicted_action}")
+                print(f"Action: {predicted_action}")
                 pass
 
             # 5) 30 FPS 유지를 위한 정밀 대기
