@@ -143,21 +143,29 @@ class Dataset_manager:
 
                 if self.dataset is not None:
                     kinect_msg, wrist_msg, follow_msg, leader_msg = raw_data
+
+                    # 1. 이미지 처리 (디코딩)
                     kinect_img = decode_image(kinect_msg)
                     wrist_img = decode_image(wrist_msg)
-                    follower_joint_data = np.array(follow_msg.position, dtype=np.float32)
-                    leader_joint_data = np.array(leader_msg.position, dtype=np.float32)
 
+                    # 2. 팔로워(State) 데이터 정렬
+                    follow_map = dict(zip(follow_msg.name, follow_msg.position))
+                    follower_joint_data = np.array([follow_map[name] for name in self.joint_names], dtype=np.float32)
+
+                    # 3. 리더(Action) 데이터 정렬
+                    leader_map = dict(zip(leader_msg.name, leader_msg.position))
+                    leader_joint_data = np.array([leader_map[name] for name in self.joint_names], dtype=np.float32)
+
+                    # 4. 데이터셋 추가
                     if kinect_img is not None and wrist_img is not None:
                         with self.lock:
-                            if self.dataset is not None:
-                                self.dataset.add_frame({
-                                    f'observation.images.cam_top': kinect_img,
-                                    f'observation.images.cam_wrist': wrist_img,
-                                    f'observation.state': follower_joint_data,
-                                    f'action': leader_joint_data,
-                                    f'task': self.task_name
-                                })
+                            self.dataset.add_frame({
+                                'observation.images.cam_top': kinect_img,
+                                'observation.images.cam_wrist': wrist_img,
+                                'observation.state': follower_joint_data,
+                                'action': leader_joint_data,
+                                'task': self.task_name
+                            })
 
                 self.data_queue.task_done()
             except queue.Empty:
