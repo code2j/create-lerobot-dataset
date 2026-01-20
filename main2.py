@@ -4,7 +4,6 @@ import numpy as np
 from pathlib import Path
 import threading
 import time
-import queue
 import os
 import shutil
 import subprocess
@@ -12,7 +11,6 @@ import signal
 
 # 허깅페이스 오프라인 모드 ON
 os.environ["HF_HUB_OFFLINE"] = "1"
-
 
 # NumPy 2.x 호환성 경고 방지를 위한 설정
 os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
@@ -25,8 +23,39 @@ from sensor_msgs.msg import CompressedImage, JointState
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_FEATURES
 
-from data_converter import decode_image
+# 내가 만든 모듈
 from subscriber_hub import SubscriberHub
+
+def decode_image(msg: CompressedImage):
+    """압축된 이미지 메시지를 OpenCV 이미지로 변환 및 실행 시간 출력"""
+    start_time = time.perf_counter()  # 측정 시작
+
+    try:
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        cv_image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+
+        # 실행 시간 계산 (초 단위 -> 밀리초 단위로 변환)
+        end_time = time.perf_counter()
+        elapsed_time = (end_time - start_time) * 1000
+        print(f"이미지 디코딩 소요 시간: {elapsed_time:.2f} ms")
+
+        return cv_image_rgb
+    except Exception as e:
+        print(f"이미지 디코딩 오류: {e}")
+        return None
+
+def decode_image_for_rendering(msg: CompressedImage):
+    """UI 출력용 디코딩"""
+    try:
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        cv_image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+        return cv_image_rgb
+    except Exception as e:
+        print(f"이미지 디코딩 오류: {e}")
+        return None
+
 
 class Dataset_manager:
     def __init__(self, subscriber_hub: SubscriberHub):
@@ -36,16 +65,13 @@ class Dataset_manager:
         self.running = True
         self.lock = threading.Lock()
 
-        # 비동기 처리를 위한 큐 추가
-        self.data_queue = queue.Queue()
-
         self.max_record_time = 0
         self.start_time = 0
         self.fps = 30
 
         # 에피소드 구분을 위한 ID 관리
         self.current_episode_id = 0
-        self.canceled_episode_ids = set() # 취소된 에피소드 ID 목록
+        self.is_canceled = False # 현재 에피소드 취소 여부
 
         self.joint_names = [
             'right_joint1', 'right_joint2', 'right_joint3',
@@ -53,15 +79,11 @@ class Dataset_manager:
             'right_rh_r1_joint'
         ]
 
-        # 1. 생산자 쓰레드: 데이터를 수집하여 큐에 넣음
+        # 단일 녹화 스레드: 데이터를 수집하고 즉시 처리
         self.record_thread = threading.Thread(target=self._recording_loop, daemon=True)
         self.record_thread.start()
 
-        # 2. 소비자 쓰레드: 큐에서 데이터를 꺼내 디코딩 및 저장
-        self.consumer_thread = threading.Thread(target=self._consumer_loop, daemon=True)
-        self.consumer_thread.start()
-
-        print("[Info ] 녹화 및 소비자 쓰레드가 시작")
+        print("[Info ] 녹화 스레드가 시작되었습니다 (직접 처리 방식)")
 
     def init_dataset(self, repo_id, root_dir, task_name, fps) -> str:
         """데이터셋 초기화 및 생성"""
@@ -115,7 +137,7 @@ class Dataset_manager:
                 return "✅ 데이터셋 생성"
 
     def _recording_loop(self):
-        """생산자: 정밀한 타이밍에 맞춰 데이터만 수집하여 큐에 삽입"""
+        """데이터 수집 및 즉시 디코딩/저장 루프"""
         next_time = time.time()
 
         while self.running:
@@ -130,8 +152,35 @@ class Dataset_manager:
                 # 1. 데이터 수집
                 raw_data = self.subscriber_hub.get_latest_msg()
 
-                # 2. 큐에 삽입 (에피소드 ID와 함께 삽입하여 구분 가능하게 함)
-                self.data_queue.put((self.current_episode_id, raw_data))
+                # 2. 즉시 처리 (디코딩 및 데이터셋 추가)
+                if not self.is_canceled:
+                    try:
+                        kinect_msg, wrist_msg, follow_msg, leader_msg = raw_data
+
+                        # 이미지 디코딩
+                        kinect_img = decode_image(kinect_msg)
+                        wrist_img = decode_image(wrist_msg)
+
+                        # 팔로워(State) 데이터 정렬
+                        follow_map = dict(zip(follow_msg.name, follow_msg.position))
+                        follower_joint_data = np.array([follow_map[name] for name in self.joint_names], dtype=np.float32)
+
+                        # 리더(Action) 데이터 정렬
+                        leader_map = dict(zip(leader_msg.name, leader_msg.position))
+                        leader_joint_data = np.array([leader_map[name] for name in self.joint_names], dtype=np.float32)
+
+                        # 데이터셋 추가
+                        if kinect_img is not None and wrist_img is not None:
+                            with self.lock:
+                                self.dataset.add_frame({
+                                    'observation.images.cam_top': kinect_img,
+                                    'observation.images.cam_wrist': wrist_img,
+                                    'observation.state': follower_joint_data,
+                                    'action': leader_joint_data,
+                                    'task': self.task_name
+                                })
+                    except Exception as e:
+                        print(f"[Error] 데이터 처리 중 오류: {e}")
 
                 # 3. 정밀 타이밍 제어
                 next_time += frame_interval
@@ -144,51 +193,6 @@ class Dataset_manager:
                 time.sleep(0.1)
                 next_time = time.time()
 
-    def _consumer_loop(self):
-        """큐에서 데이터를 꺼내 작업 수행(디코딩 및 변환)"""
-        while self.running:
-            try:
-                # 큐에서 (에피소드 ID, 데이터) 튜플을 꺼냄
-                item = self.data_queue.get(timeout=0.1)
-                ep_id, raw_data = item
-
-                # 만약 이 에피소드가 취소된 것이라면 데이터를 처리하지 않고 버림
-                if ep_id in self.canceled_episode_ids:
-                    self.data_queue.task_done()
-                    continue
-
-                if self.dataset is not None:
-                    kinect_msg, wrist_msg, follow_msg, leader_msg = raw_data
-
-                    # 1. 이미지 처리 (디코딩)
-                    kinect_img = decode_image(kinect_msg)
-                    wrist_img = decode_image(wrist_msg)
-
-                    # 2. 팔로워(State) 데이터 정렬
-                    follow_map = dict(zip(follow_msg.name, follow_msg.position))
-                    follower_joint_data = np.array([follow_map[name] for name in self.joint_names], dtype=np.float32)
-
-                    # 3. 리더(Action) 데이터 정렬
-                    leader_map = dict(zip(leader_msg.name, leader_msg.position))
-                    leader_joint_data = np.array([leader_map[name] for name in self.joint_names], dtype=np.float32)
-
-                    # 4. 데이터셋 추가
-                    if kinect_img is not None and wrist_img is not None:
-                        with self.lock:
-                            self.dataset.add_frame({
-                                'observation.images.cam_top': kinect_img,
-                                'observation.images.cam_wrist': wrist_img,
-                                'observation.state': follower_joint_data,
-                                'action': leader_joint_data,
-                                'task': self.task_name
-                            })
-
-                self.data_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"[Error] 소비자 루프 오류: {e}")
-
     def start_recording(self, max_time=0):
         if self.dataset is None:
             return "❌ 오류: 데이터셋이 초기화되지 않았습니다."
@@ -198,6 +202,7 @@ class Dataset_manager:
 
         self.max_record_time = max_time
         self.start_time = time.time()
+        self.is_canceled = False
 
         # 새로운 에피소드 시작 시 ID 증가
         self.current_episode_id += 1
@@ -213,51 +218,27 @@ class Dataset_manager:
 
         self.is_recording = False
 
-        # 현재 에피소드 ID를 고정하여 저장 쓰레드에 전달
-        finished_ep_id = self.current_episode_id
-
-        # 백그라운드에서 큐가 비워지면 저장하도록 함
-        threading.Thread(target=self._wait_and_save, args=(finished_ep_id,), daemon=True).start()
-
-        msg = "백그라운드 저장 중..."
-        print(f"[Info ] {msg}")
-        return msg
+        # 즉시 저장 (이미 add_frame이 완료된 상태이므로)
+        try:
+            with self.lock:
+                self.dataset.save_episode()
+            print(f"[Info ] 에피소드 {self.current_episode_id} 저장 완료")
+            return "✅ 에피소드 저장 완료"
+        except Exception as e:
+            print(f"[Error] 에피소드 저장 중 오류: {e}")
+            return f"❌ 저장 오류: {e}"
 
     def cancel_recording(self):
-        """현재 녹화를 취소하고 해당 에피소드 데이터를 무시하도록 설정"""
+        """현재 녹화를 취소"""
         if not self.is_recording:
             return "⚠️ 시스템: 현재 녹화 중이 아닙니다."
 
         self.is_recording = False
-
-        # 현재 에피소드 ID를 취소 목록에 추가 (소비자 루프에서 이 ID를 가진 데이터는 버려짐)
-        self.canceled_episode_ids.add(self.current_episode_id)
+        self.is_canceled = True
 
         msg = "현재 에피소드 녹화 취소됨"
         print(f"[Info ] {msg} (ID: {self.current_episode_id})")
         return msg
-
-    def _wait_and_save(self, ep_id):
-        """특정 에피소드의 데이터가 큐에서 모두 처리될 때까지 기다린 후 저장"""
-        print(f"[Info ] 에피소드 {ep_id} 데이터를 처리 중입니다...")
-
-        # 큐가 완전히 비워질 때까지 기다리는 대신,
-        # 소비자 루프가 데이터를 처리하는 속도를 고려하여 큐를 모니터링하거나
-        # 간단하게 전체 큐가 비워질 때까지 기다림 (이전 에피소드들이 순차적으로 쌓이므로)
-        self.data_queue.join()
-
-        with self.lock:
-            # 취소된 에피소드가 아닐 때만 저장
-            if self.dataset is not None and ep_id not in self.canceled_episode_ids:
-                try:
-                    self.dataset.save_episode()
-                    print(f"[Info ] 에피소드 {ep_id} 저장 완료")
-                except Exception as e:
-                    print(f"[Error] 에피소드 저장 중 오류: {e}")
-
-            # 처리가 끝난 ID는 메모리 관리를 위해 제거 (선택 사항)
-            if ep_id in self.canceled_episode_ids:
-                self.canceled_episode_ids.remove(ep_id)
 
     def finalize_dataset(self):
         """데이터 수집 완료 및 데이터셋 최종화"""
@@ -267,27 +248,24 @@ class Dataset_manager:
         if self.is_recording:
             return "❌ 오류: 녹화 중에는 데이터셋을 완료할 수 없습니다."
 
-        if not self.data_queue.empty():
-            return "⏳ 시스템: 아직 처리 중인 데이터가 있습니다. 잠시 후 다시 시도해주세요."
-
-        with self.lock:
-            try:
-                self.dataset.finalize()
-                # 최종화 후 데이터셋 객체를 None으로 설정하여 키 리스너가 동작하지 않게 함
-                self.dataset = None
-                msg = "✅ 데이터 수집 완료 및 데이터셋 최종화 성공"
-                print(msg)
-                return msg
-            except Exception as e:
-                msg = f"❌ 시스템: 데이터셋 최종화 중 오류 발생: {e}"
-                print(msg)
-                return msg
+        try:
+            self.dataset.finalize()
+            # 최종화 후 데이터셋 객체를 None으로 설정하여 키 리스너가 동작하지 않게 함
+            self.dataset = None
+            msg = "✅ 데이터 수집 완료 및 데이터셋 최종화 성공"
+            print(msg)
+            return msg
+        except Exception as e:
+            msg = f"❌ 시스템: 데이터셋 최종화 중 오류 발생: {e}"
+            print(msg)
+            return msg
 
     def close(self):
         self.running = False
-        self.record_thread.join()
-        self.consumer_thread.join()
+        if self.record_thread.is_alive():
+            self.record_thread.join()
         print("시스템: 모든 쓰레드가 종료되었습니다.")
+
 
 from pynput import keyboard
 class GradioVisualizer:
@@ -325,7 +303,7 @@ class GradioVisualizer:
                     self.right_pressed = True
                     self.last_key_time = current_time
                     self._toggle_recording()
-            # 왼쪽 방향키: 녹화 취소 (자동 재시작 제거)
+            # 왼쪽 방향키: 녹화 취소
             elif key == keyboard.Key.left:
                 if not self.left_pressed:
                     self.left_pressed = True
@@ -351,7 +329,7 @@ class GradioVisualizer:
             self.current_status = self.dataset_manager.start_recording(max_time=0)
 
     def _re_record(self):
-        """현재 녹화를 취소 (자동 재시작 기능 제거)"""
+        """현재 녹화를 취소"""
         if self.dataset_manager.is_recording:
             self.current_status = self.dataset_manager.cancel_recording()
         else:
@@ -359,8 +337,8 @@ class GradioVisualizer:
 
     def ui_timer_callback(self):
         (k_msg, w_msg, f_joint, l_joint) = self.subscriber_hub.get_latest_msg()
-        k_img = decode_image(k_msg)
-        w_img = decode_image(w_msg)
+        k_img = decode_image_for_rendering(k_msg)
+        w_img = decode_image_for_rendering(w_msg)
 
         desired_names = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6', 'right_rh_r1_joint']
 
@@ -375,16 +353,10 @@ class GradioVisualizer:
             leader_text = f"J1: {l_vals[0]:.1f} J2: {l_vals[1]:.1f} J3: {l_vals[2]:.1f} J4: {l_vals[3]:.1f} J5: {l_vals[4]:.1f} J6: {l_vals[5]:.1f} G: {l_vals[6]:.1f}"
 
         display_status = self.current_status
-        q_size = self.dataset_manager.data_queue.qsize()
 
         if self.dataset_manager.is_recording:
             elapsed = time.time() - self.dataset_manager.start_time
-            display_status = f"{self.current_status} ({elapsed:.1f}s) | 큐: {q_size}"
-        elif q_size > 0:
-            display_status = f"⏳ 저장 중... (남은 작업: {q_size})"
-        elif "저장 중" in self.current_status and q_size == 0:
-            self.current_status = "✅ 대기 중 (저장 완료)"
-            display_status = self.current_status
+            display_status = f"{self.current_status} ({elapsed:.1f}s)"
 
         return k_img, w_img, follower_text, leader_text, display_status
 
