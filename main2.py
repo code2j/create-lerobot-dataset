@@ -305,14 +305,13 @@ class GradioVisualizer:
         # 상태 메시지 관리
         self.current_status = "✅ 대기 중"
 
-        # pynput 리스너 설정
+        # 키보드 리스너 시작
         self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
         self.listener.start()
 
     def _on_press(self, key):
         try:
             # 데이터셋이 초기화된 상태에서만 키 입력 처리
-            # finalize_dataset 호출 시 self.dataset_manager.dataset이 None이 되므로 리스너가 비활성화됨
             if self.dataset_manager.dataset is None:
                 return
 
@@ -326,7 +325,7 @@ class GradioVisualizer:
                     self.right_pressed = True
                     self.last_key_time = current_time
                     self._toggle_recording()
-            # 왼쪽 방향키: 재녹화
+            # 왼쪽 방향키: 녹화 취소 (자동 재시작 제거)
             elif key == keyboard.Key.left:
                 if not self.left_pressed:
                     self.left_pressed = True
@@ -350,17 +349,13 @@ class GradioVisualizer:
             self.current_status = self.dataset_manager.stop_recording()
         else:
             self.current_status = self.dataset_manager.start_recording(max_time=0)
-        # print(f"[Key Event] '오른쪽 방향키' 입력: {self.current_status}")
 
     def _re_record(self):
-        """현재 녹화를 취소하고 즉시 다시 시작"""
+        """현재 녹화를 취소 (자동 재시작 기능 제거)"""
         if self.dataset_manager.is_recording:
-            self.dataset_manager.cancel_recording()
-            self.current_status = self.dataset_manager.start_recording(max_time=0)
-            # print(f"[Key Event] '왼쪽 방향키' 입력: 재녹화 시작 (이전 데이터 보호됨)")
+            self.current_status = self.dataset_manager.cancel_recording()
         else:
-            self.current_status = self.dataset_manager.start_recording(max_time=0)
-            # print(f"[Key Event] '왼쪽 방향키' 입력: 녹화 시작")
+            self.current_status = "⚠️ 시스템: 현재 녹화 중이 아닙니다."
 
     def ui_timer_callback(self):
         (k_msg, w_msg, f_joint, l_joint) = self.subscriber_hub.get_latest_msg()
@@ -404,10 +399,11 @@ class GradioVisualizer:
         return res
 
     def handle_re_record(self):
-        """재녹화 버튼 핸들러"""
+        """재녹화 버튼 핸들러 (취소만 수행하도록 수정)"""
         if self.dataset_manager.is_recording:
-            self.dataset_manager.cancel_recording()
-        res = self.dataset_manager.start_recording(max_time=0)
+            res = self.dataset_manager.cancel_recording()
+        else:
+            res = "⚠️ 시스템: 현재 녹화 중이 아닙니다."
         self.current_status = res
         return res
 
@@ -447,7 +443,7 @@ class GradioVisualizer:
 
             with gr.Row():
                 record_btn = gr.Button("Record (Right Arrow)", variant="primary")
-                re_record_btn = gr.Button("Re-record (Left Arrow)", variant="secondary")
+                re_record_btn = gr.Button("Cancel Recording (Left Arrow)", variant="secondary")
                 stop_btn = gr.Button("Stop", variant="stop")
                 finalize_btn = gr.Button("데이터 수집 완료 (Finalize)", variant="secondary")
 
