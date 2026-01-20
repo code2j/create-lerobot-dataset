@@ -167,14 +167,6 @@ class Dataset_manager:
             except Exception as e:
                 print(f"[Error] 소비자 루프 오류: {e}")
 
-
-    def toggle_recording(self, max_time=0):
-        """스페이스바 단축키를 위한 토글 기능: 상태에 따라 분기"""
-        if self.is_recording:
-            return self.stop_recording()
-        else:
-            return self.start_recording(max_time)
-
     def start_recording(self, max_time=0):
         if self.dataset is None:
             return "오류: 데이터셋이 초기화되지 않았습니다."
@@ -186,7 +178,7 @@ class Dataset_manager:
         self.start_time = time.time()
         self.is_recording = True
 
-        msg = "시스템: 녹화를 시작합니다. (Space 키로 중단 가능)"
+        msg = "시스템: 녹화를 시작합니다."
         print(msg)
         return msg
 
@@ -283,24 +275,6 @@ class GradioVisualizer:
     def create_interface(self):
         default_root_dir = os.path.join(os.getcwd(), "dataset")
 
-        # 스페이스바 감지를 위한 JavaScript
-        js_code = """
-        function() {
-            document.addEventListener('keydown', function(e) {
-                if (e.code === 'Space') {
-                    const active = document.activeElement;
-                    if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable) {
-                        return;
-                    }
-                    e.preventDefault();
-                    // 숨겨진 토글 버튼을 클릭하게 함
-                    const btn = document.getElementById('toggle_btn');
-                    if (btn) btn.click();
-                }
-            });
-        }
-        """
-
         with gr.Blocks(title="Robot Data Collector") as demo:
             gr.Markdown("# 🤖 Robot Data Collector")
 
@@ -323,13 +297,9 @@ class GradioVisualizer:
             status_output = gr.Textbox(label="Status")
 
             with gr.Row():
-                # 버튼 이름을 명확하게 수정
                 record_btn = gr.Button("Record", variant="primary")
                 stop_btn = gr.Button("Stop", variant="stop")
                 finalize_btn = gr.Button("데이터 수집 완료 (Finalize)", variant="secondary")
-
-            # 스페이스바 전용 숨겨진 버튼 (UI에는 보이지 않음)
-            toggle_btn = gr.Button("Toggle Recording", visible=False, elem_id="toggle_btn")
 
             init_btn.click(self.dataset_manager.init_dataset, [repo_id_input, root_dir_input, task_name_input, fps_input], status_output)
 
@@ -337,9 +307,6 @@ class GradioVisualizer:
             record_btn.click(self.dataset_manager.start_recording, [max_time_input], status_output)
             stop_btn.click(self.dataset_manager.stop_recording, outputs=status_output)
             finalize_btn.click(self.dataset_manager.finalize_dataset, outputs=status_output)
-
-            # 스페이스바 토글 이벤트 (상태에 따라 자동 분기)
-            toggle_btn.click(self.dataset_manager.toggle_recording, [max_time_input], status_output)
 
             timer = gr.Timer(value=self.update_interval)
             timer.tick(
@@ -350,13 +317,11 @@ class GradioVisualizer:
                 ]
             )
 
-            self.js_code = js_code
-
         return demo
 
     def launch(self):
         demo = self.create_interface()
-        demo.launch(server_name="0.0.0.0", server_port=7860, js=self.js_code)
+        demo.launch(server_name="0.0.0.0", server_port=7860)
 
 if __name__ == "__main__":
     import rclpy
