@@ -32,3 +32,6 @@ lerobot-train \
      --steps 50000 \
      --policy.push_to_hub false
 ```
+
+dev1
+- main3.py를 위한 개발 브렌치
