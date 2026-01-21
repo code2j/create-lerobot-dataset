@@ -368,7 +368,6 @@ class GradioWeb:
 
                 # 데이터 메니저 상태
                 status = self.dataset_manager.status
-                print("디버깅: 키눌림")
 
                 if status == "":
                     print(f"[Warn ] 데이터 녹화 실패: 초기화 필요")
