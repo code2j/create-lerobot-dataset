@@ -35,3 +35,16 @@ lerobot-train \
 
 dev1
 - main3.py를 위한 개발 브렌치
+
+
+```shell
+lerobot-train \
+--dataset.repo_id my_dataset \
+--dataset.root /home/jusik/workspace/lerobot-dataset-collector/data/my_dataset \
+--policy.type act \
+--output_dir data/train/act_uon \
+--batch_size 1 \
+--steps 50000 \
+--policy.push_to_hub false
+
+```

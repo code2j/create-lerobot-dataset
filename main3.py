@@ -98,7 +98,7 @@ class LerobotDatasetManager:
     def init_dataset(self, repo_id="my_dataset", root_dir="data", task_name="teleop", fps=30) -> str:
         """데이터셋 초기화 및 생성"""
         self.repo_id = repo_id
-        self.root_path = Path(root_dir).absolute()
+        self.root_path = Path(root_dir).absolute() / self.repo_id
         self.task_name = task_name
         self.fps = fps
 
