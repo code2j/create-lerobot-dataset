@@ -48,3 +48,17 @@ lerobot-train \
 --policy.push_to_hub false
 
 ```
+
+
+
+```shell
+lerobot-train \
+--dataset.repo_id my_dataset \
+--dataset.root /home/uon/workspace/create-lerobot-dataset-master/data/my_dataset \
+--policy.type act \
+--output_dir data/train/act_uon \
+--batch_size 1 \
+--steps 50000 \
+--policy.push_to_hub false \
+--dataset.video_backend pyav 
+```
