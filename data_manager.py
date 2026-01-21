@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -53,9 +54,20 @@ class LerobotDatasetManager:
         self.recording_start_time = 0
         self.num_frames = 0
         self.fps = 30
+
         self.status = ""
         self.last_save_result_message = ""
-        self.joint_names = ['right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6', 'right_rh_r1_joint']
+
+        self.joint_names = [
+            'right_joint1',
+            'right_joint2',
+            'right_joint3',
+            'right_joint4',
+            'right_joint5',
+            'right_joint6',
+            'right_rh_r1_joint'
+        ]
+
         self.stop_event = threading.Event()
         self.timer_thread = None
 
@@ -66,18 +78,36 @@ class LerobotDatasetManager:
         self.fps = fps
         meta_info_path = self.root_path  / "meta" / "info.json"
 
+        # 이미 데이터셋이 있다면 기존 데이터셋 불러오기
         if meta_info_path.exists():
             self.dataset = LeRobotDataset(repo_id=self.repo_id, root=self.root_path)
-            self.dataset.start_image_writer(num_processes=2, num_threads=4)
+            self.dataset.start_image_writer(num_processes=2, num_threads=4) # 프로세서 늘리기
             return f"✅ 기존 데이터셋 불러오기 성공"
 
-
+        # 데이터셋 생성 및 초기화
         features = DEFAULT_FEATURES.copy()
-        features['observation.images.cam_top'] = {'dtype': 'video', 'names': ['height', 'width', 'channels'], 'shape': (720, 1280, 3)}
-        features['observation.images.cam_wrist'] = {'dtype': 'video', 'names': ['height', 'width', 'channels'], 'shape': (480, 848, 3)}
-        features['observation.state'] = {'dtype': 'float32', 'names': self.joint_names, 'shape': (7,)}
-        features['action'] = {'dtype': 'float32', 'names': self.joint_names, 'shape': (7,)}
+        features['observation.images.cam_top'] = {
+            'dtype': 'video',
+            'names': ['height', 'width', 'channels'],
+            'shape': (720, 1280, 3)
+        }
+        features['observation.images.cam_wrist'] = {
+            'dtype': 'video',
+            'names': ['height', 'width', 'channels'],
+            'shape': (480, 848, 3)
+        }
+        features['observation.state'] = {
+            'dtype': 'float32',
+            'names': self.joint_names,
+            'shape': (7,)
+        }
+        features['action'] = {
+            'dtype': 'float32',
+            'names': self.joint_names,
+            'shape': (7,)
+        }
 
+        # 생성
         self.dataset = LeRobotDataset.create(
             repo_id=self.repo_id,
             root=self.root_path,
@@ -91,37 +121,66 @@ class LerobotDatasetManager:
         return f"✅ 데이터셋 초기화 완료"
 
     def start_timer(self):
-        if self.timer_thread is not None and self.timer_thread.is_alive(): return
+        """Recording Loop 타이머 시작"""
+        if self.timer_thread is not None and self.timer_thread.is_alive():
+            return # 이미 타이머가 실행 중인 경우 무시
+
         self.stop_event.clear()
         self.timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
         self.timer_thread.start()
+
+        # 데이터 수집이 가능한 상태
         self.status = "ready"
 
     def _timer_loop(self):
+        """Recording Loop(메인 루프)"""
         interval = 1.0 / self.fps
         next_time = time.time()
+
+        # 메인 루프
         while not self.stop_event.is_set():
+            # 최신 메세지 토픽 받기
             k_msg, w_msg, f_msg, l_msg = self.subscriber_hub.get_latest_msg()
+
+            # 녹화 함수
             self._record_loop(k_msg, w_msg, f_msg, l_msg)
+
+            # 타이머 속도 조절
             next_time += interval
             sleep_time = next_time - time.time()
-            if sleep_time > 0: time.sleep(sleep_time)
-            else: next_time = time.time()
+
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_time = time.time()
 
     def _record_loop(self, kinect_msg, wrist_msg, follower_msg, leader_msg):
         if self.dataset is None: return
         with self.lock:
+            # 데이터 녹화중
             if self.status == "record":
-                if self.recording_start_time == 0: self.recording_start_time = time.time()
-                k_img = decode_image(kinect_msg)
-                w_img = decode_image(wrist_msg)
-                f_joint = jointState_to_nparray(follower_msg, self.joint_names)
-                l_joint = jointState_to_nparray(leader_msg, self.joint_names)
+                if self.recording_start_time == 0:
+                    self.recording_start_time = time.time() # 에피소드 녹화 시간 측정
 
-                frame = {'observation.images.cam_top': k_img, 'observation.images.cam_wrist': w_img,
-                         'observation.state': f_joint, 'action': l_joint, 'task': self.task_name}
+                # 데이터 변환
+                k_img = decode_image(kinect_msg) # 디코딩
+                w_img = decode_image(wrist_msg)  # 디코딩
+                f_joint = jointState_to_nparray(follower_msg, self.joint_names) # 넘파이로 변환
+                l_joint = jointState_to_nparray(leader_msg, self.joint_names)   # 넘파이로 변환
+
+                # 프레임 생성
+                frame = {}
+                frame['observation.images.cam_top'] = k_img
+                frame['observation.images.cam_wrist'] = w_img
+                frame['observation.state'] = f_joint
+                frame['action'] = l_joint
+                frame['task'] = self.task_name
+
+                # 프레임 추가
                 self.dataset.add_frame(frame)
                 self.num_frames += 1
+
+            # 재시도중
             elif self.status == "retry":
                 self.dataset.clear_episode_buffer()
                 self.status = "ready"
