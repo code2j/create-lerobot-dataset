@@ -180,7 +180,7 @@ class LerobotDatasetManager:
                 self.dataset.add_frame(frame)
                 self.num_frames += 1
 
-            # 재시도중
+            # 재시도: 현재 에피소드 버퍼 제거
             elif self.status == "retry":
                 self.dataset.clear_episode_buffer()
                 self.status = "ready"
