@@ -201,15 +201,17 @@ def main():
                 task_instruction="pick up the zipper bag"
             )
 
+            print(f'[Debug] state:\n {current_states}')
+
             # 4) JointTrajectory 메시지 생성 및 발행
-            if predicted_action is not None:
-                msg = tensor_array2joint_msgs(predicted_action, TOTAL_JOINT_NAMES)
-
-                # 토픽 발행
-                joint_pub.publish(msg)
-
-                # 디버깅 출력: msg에서 직접 값을 가져오도록 변경
-                print(f"Published Joint States: {np.round(msg.points[0].positions, 4)}")
+            # if predicted_action is not None:
+            #     msg = tensor_array2joint_msgs(predicted_action, TOTAL_JOINT_NAMES)
+            #
+            #     # 토픽 발행
+            #     joint_pub.publish(msg)
+            #
+            #     # 디버깅 출력: msg에서 직접 값을 가져오도록 변경
+            #     print(f"Published Joint States: {np.round(msg.points[0].positions, 4)}")
 
             # 5) 주기 유지
             elapsed = time.perf_counter() - start_time

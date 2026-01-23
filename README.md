@@ -62,3 +62,13 @@ lerobot-train \
 --policy.push_to_hub false \
 --dataset.video_backend pyav 
 ```
+
+
+
+lerobot-train \
+--dataset.repo_id=test/omy_f3m_test \
+--policy.type=act \
+--output_dir=outputs/my_first_train \
+--batch_size=8 \
+--steps=100000 \
+--policy.push_to_hub false
